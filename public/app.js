@@ -11,6 +11,7 @@ const metricsSection = document.getElementById('metrics');
 const metricsList = document.getElementById('metrics-list');
 const consoleLog = document.getElementById('console-log');
 const consoleSection = document.getElementById('console');
+const googleLoginBtn = document.getElementById('google-login');
 
 const keyForResult = (format = '', label = '') =>
   `${String(format).toLowerCase()}::${String(label).toLowerCase()}`;
@@ -61,6 +62,7 @@ let jobNonce = 0;
 let originalFile = null;
 let originalFileBuffer = null;
 const MAX_FILE_SIZE = 100 * 1024 * 1024; // 100 MB
+let authProfile = null;
 
 const preventDefaults = (event) => {
   event.preventDefault();
@@ -93,6 +95,10 @@ browseBtn.addEventListener('click', () => fileInput.click());
 fileInput.addEventListener('change', () => {
   const file = fileInput.files?.[0];
   if (file) handleFile(file);
+});
+
+document.addEventListener('DOMContentLoaded', () => {
+  initGoogleLogin();
 });
 
 function handleFile(file) {
@@ -143,6 +149,17 @@ function toggleUploading(state) {
   browseBtn.disabled = state;
 }
 
+function setAuthProfile(profile) {
+  authProfile = profile;
+  if (profile && googleLoginBtn) {
+    googleLoginBtn.textContent = `Hi, ${profile.name || profile.email || 'user'}`;
+    googleLoginBtn.classList.add('logged-in');
+  } else if (googleLoginBtn) {
+    googleLoginBtn.textContent = 'Login with Google';
+    googleLoginBtn.classList.remove('logged-in');
+  }
+}
+
 function appendLog(text) {
   if (!consoleLog) return;
   if (consoleSection && consoleSection.classList.contains('hidden')) {
@@ -158,6 +175,66 @@ function appendLog(text) {
     consoleLog.removeChild(consoleLog.firstChild);
   }
   consoleLog.scrollTop = consoleLog.scrollHeight;
+}
+
+function initGoogleLogin() {
+  const clientId =
+    window.FP_GOOGLE_CLIENT_ID ||
+    document.querySelector('meta[name="google-client-id"]')?.content ||
+    '';
+  if (!clientId || !googleLoginBtn) {
+    return;
+  }
+  const renderButton = () => {
+    if (!window.google || !google.accounts || !google.accounts.id) {
+      return;
+    }
+    google.accounts.id.initialize({
+      client_id: clientId,
+      callback: handleGoogleCredential,
+      auto_select: false,
+    });
+    google.accounts.id.renderButton(googleLoginBtn, {
+      theme: 'outline',
+      size: 'medium',
+      shape: 'pill',
+    });
+  };
+  if (window.google && window.google.accounts) {
+    renderButton();
+  } else {
+    const interval = setInterval(() => {
+      if (window.google && window.google.accounts) {
+        clearInterval(interval);
+        renderButton();
+      }
+    }, 300);
+    setTimeout(() => clearInterval(interval), 10000);
+  }
+}
+
+async function handleGoogleCredential(response) {
+  const credential = response?.credential;
+  if (!credential) {
+    appendLog('login failed: missing credential');
+    return;
+  }
+  try {
+    const res = await fetch('/auth/google', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ credential }),
+    });
+    const data = await res.json();
+    if (!res.ok || data.status !== 'ok') {
+      throw new Error(data.message || 'Auth failed');
+    }
+    appendLog(`login success for ${data.email || 'unknown'}`);
+    setAuthProfile({ email: data.email, name: data.name, picture: data.picture });
+  } catch (err) {
+    console.error(err);
+    appendLog(`login failed: ${err.message}`);
+  }
 }
 
 function classifyLog(text = '') {

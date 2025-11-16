@@ -11,6 +11,7 @@
 #include "compress.h"
 #include "log.h"
 #include "progress.h"
+#include "image_ops.h"
 
 static void fp_result_finish(fp_result *result) {
     if (result) {
@@ -142,6 +143,125 @@ static fp_compress_code fp_worker_avif_encode(const fp_rgba_image *image, int qu
     return fp_compress_avif(image, quality, output);
 }
 
+static const char *fp_default_label(const fp_requested_output *req, const char *fallback) {
+    if (req && req->label[0] != '\0') {
+        return req->label;
+    }
+    return fallback;
+}
+
+static size_t fp_worker_build_expert_tasks(const fp_job *job,
+                                           const fp_rgba_image *image,
+                                           double work_units,
+                                           fp_encode_task *tasks,
+                                           char eta_keys[][32],
+                                           fp_encoded_image *outputs) {
+    if (!job || !tasks || !eta_keys || !image) {
+        return 0;
+    }
+    size_t requested = job->requested_output_count;
+    if (requested > FP_MAX_OUTPUTS) {
+        requested = FP_MAX_OUTPUTS;
+    }
+    size_t task_count = 0;
+    for (size_t i = 0; i < requested; ++i) {
+        const fp_requested_output *req = &job->requested_outputs[i];
+        if (!req->format[0]) {
+            continue;
+        }
+        const char *format = req->format;
+        if (strcasecmp(format, "png") == 0) {
+            int level = req->compression_level != 0 ? req->compression_level : (req->quality != 0 ? req->quality : 6);
+            level = fp_clamp_int(level, 1, 9);
+            size_t idx = task_count;
+            worker_eta_make_key(eta_keys[idx], sizeof(eta_keys[idx]), "png_custom", work_units);
+            tasks[idx] = (fp_encode_task){
+                .image = image,
+                .quality = level,
+                .label = fp_default_label(req, "custom"),
+                .log_name = fp_default_label(req, "PNG custom"),
+                .eta_key = eta_keys[idx],
+                .output = &outputs[idx],
+                .encode = fp_worker_png_encode,
+                .job = (fp_job *)job,
+                .failure_status = -2,
+                .failure_message = "png_compress_error",
+                .work_units = work_units,
+                .tune_direction = 0,
+                .format = "png",
+            };
+            task_count++;
+        } else if (strcasecmp(format, "pngquant") == 0 || strcasecmp(req->label, "pngquant q80") == 0) {
+            int colors = req->quality != 0 ? req->quality : (req->compression_level != 0 ? req->compression_level : 128);
+            colors = fp_clamp_int(colors, 8, 256);
+            size_t idx = task_count;
+            worker_eta_make_key(eta_keys[idx], sizeof(eta_keys[idx]), "png_quant_custom", work_units);
+            tasks[idx] = (fp_encode_task){
+                .image = image,
+                .quality = colors,
+                .label = fp_default_label(req, "pngquant"),
+                .log_name = fp_default_label(req, "PNG pngquant"),
+                .eta_key = eta_keys[idx],
+                .output = &outputs[idx],
+                .encode = fp_worker_png_quant,
+                .job = (fp_job *)job,
+                .failure_status = -5,
+                .failure_message = "pngquant_error",
+                .work_units = work_units,
+                .tune_direction = 0,
+                .format = "png",
+            };
+            task_count++;
+        } else if (strcasecmp(format, "webp") == 0) {
+            int quality = fp_clamp_int(req->quality != 0 ? req->quality : 90, 10, 100);
+            size_t idx = task_count;
+            worker_eta_make_key(eta_keys[idx], sizeof(eta_keys[idx]), "webp_custom", work_units);
+            tasks[idx] = (fp_encode_task){
+                .image = image,
+                .quality = quality,
+                .label = fp_default_label(req, "custom"),
+                .log_name = fp_default_label(req, "WEBP custom"),
+                .eta_key = eta_keys[idx],
+                .output = &outputs[idx],
+                .encode = fp_worker_webp_encode,
+                .job = (fp_job *)job,
+                .failure_status = -3,
+                .failure_message = "webp_compress_error",
+                .work_units = work_units,
+                .tune_direction = 0,
+                .format = "webp",
+            };
+            task_count++;
+        } else if (strcasecmp(format, "avif") == 0) {
+            int quality = req->quality != 0 ? req->quality : 28;
+            quality = fp_clamp_int(quality, 0, 63);
+            size_t idx = task_count;
+            worker_eta_make_key(eta_keys[idx], sizeof(eta_keys[idx]), "avif_custom", work_units);
+            tasks[idx] = (fp_encode_task){
+                .image = image,
+                .quality = quality,
+                .label = fp_default_label(req, "custom"),
+                .log_name = fp_default_label(req, "AVIF custom"),
+                .eta_key = eta_keys[idx],
+                .output = &outputs[idx],
+                .encode = fp_worker_avif_encode,
+                .job = (fp_job *)job,
+                .failure_status = -4,
+                .failure_message = "avif_compress_error",
+                .work_units = work_units,
+                .tune_direction = 0,
+                .format = "avif",
+            };
+            task_count++;
+        } else {
+            continue;
+        }
+        if (task_count >= FP_MAX_OUTPUTS) {
+            break;
+        }
+    }
+    return task_count;
+}
 static void fp_worker_free_encoded(fp_encoded_image *img) {
     if (!img || !img->data) {
         return;
@@ -324,120 +444,152 @@ static fp_result *fp_worker_handle_job(fp_job *job) {
         return result;
     }
 
+    fp_image_ops_report ops_report = {0};
+    ops_report.original_width = image.width;
+    ops_report.original_height = image.height;
+
+    if (job->trim_options.enabled) {
+        float tol = job->trim_options.tolerance <= 0.0f ? 0.01f : job->trim_options.tolerance;
+        if (fp_trim_image(&image, tol, &ops_report) != 0) {
+            fp_log_warn("⚠️  trim failed for job #%llu, continuing without trim", (unsigned long long)job->id);
+        }
+    }
+    if (job->crop_options.enabled) {
+        if (fp_crop_image(&image,
+                          job->crop_options.x,
+                          job->crop_options.y,
+                          job->crop_options.width,
+                          job->crop_options.height,
+                          &ops_report) != 0) {
+            fp_log_warn("⚠️  crop failed for job #%llu, continuing without crop", (unsigned long long)job->id);
+        }
+    }
+
+    result->input_width = ops_report.original_width;
+    result->input_height = ops_report.original_height;
+    result->output_width = image.width;
+    result->output_height = image.height;
+    result->trim_applied = ops_report.trim_applied;
+    result->crop_applied = ops_report.crop_applied;
+
     double work_units = ((double)image.width * image.height) / 1000000.0;
     if (work_units <= 0) {
         work_units = 0.1;
     }
 
-    int png_tune = fp_job_tune_direction(job, "png", "lossless");
-    int pngquant_tune = fp_job_tune_direction(job, "png", "pngquant q80");
-    int webp_tune = fp_job_tune_direction(job, "webp", "high");
-    int avif_tune = fp_job_tune_direction(job, "avif", "medium");
-
-    int png_level = fp_clamp_int(png_tune > 0 ? 9 : (png_tune < 0 ? 1 : 5), 1, 9);
-    int pngquant_colors = fp_clamp_int(pngquant_tune > 0 ? 96 : (pngquant_tune < 0 ? 192 : 128), 8, 256);
-    int webp_quality = fp_clamp_int(webp_tune > 0 ? 60 : (webp_tune < 0 ? 96 : 90), 10, 100);
-    int avif_quality = fp_clamp_int(avif_tune > 0 ? 36 : (avif_tune < 0 ? 20 : 28), 0, 63);
-
-    const char *png_label = "lossless";
-    const char *pngquant_label = "pngquant q80";
-    const char *webp_label = "high";
-    const char *avif_label = "medium";
-
-    fp_encode_task tasks[4];
-    char task_eta_keys[4][32];
+    fp_encode_task tasks[FP_MAX_OUTPUTS];
+    char task_eta_keys[FP_MAX_OUTPUTS][32];
     size_t task_count = 0;
 
-    if (fp_should_run_task(job, "png", png_label)) {
-        size_t idx = task_count;
-        worker_eta_make_key(task_eta_keys[idx], sizeof(task_eta_keys[idx]), "png_lossless", work_units);
-        int png_quality = png_level;
-        fp_encode_fn png_encoder = fp_worker_png_encode;
-        const char *png_log = png_tune != 0 ? "PNG lossless (tuned)" : "PNG lossless";
-        if (png_tune > 0) {
-            png_quality = 0; // unused
-            png_encoder = fp_worker_png_more;
-            png_log = "PNG lossless (tuned-more)";
+    if (job->is_expert && job->requested_output_count > 0) {
+        task_count = fp_worker_build_expert_tasks(job, &image, work_units, tasks, task_eta_keys, result->outputs);
+    } else {
+        int png_tune = fp_job_tune_direction(job, "png", "lossless");
+        int pngquant_tune = fp_job_tune_direction(job, "png", "pngquant q80");
+        int webp_tune = fp_job_tune_direction(job, "webp", "high");
+        int avif_tune = fp_job_tune_direction(job, "avif", "medium");
+
+        int png_level = fp_clamp_int(png_tune > 0 ? 9 : (png_tune < 0 ? 1 : 5), 1, 9);
+        int pngquant_colors = fp_clamp_int(pngquant_tune > 0 ? 96 : (pngquant_tune < 0 ? 192 : 128), 8, 256);
+        int webp_quality = fp_clamp_int(webp_tune > 0 ? 60 : (webp_tune < 0 ? 96 : 90), 10, 100);
+        int avif_quality = fp_clamp_int(avif_tune > 0 ? 36 : (avif_tune < 0 ? 20 : 28), 0, 63);
+
+        const char *png_label = "lossless";
+        const char *pngquant_label = "pngquant q80";
+        const char *webp_label = "high";
+        const char *avif_label = "medium";
+
+        if (fp_should_run_task(job, "png", png_label)) {
+            size_t idx = task_count;
+            worker_eta_make_key(task_eta_keys[idx], sizeof(task_eta_keys[idx]), "png_lossless", work_units);
+            int png_quality = png_level;
+            fp_encode_fn png_encoder = fp_worker_png_encode;
+            const char *png_log = png_tune != 0 ? "PNG lossless (tuned)" : "PNG lossless";
+            if (png_tune > 0) {
+                png_quality = 0; // unused
+                png_encoder = fp_worker_png_more;
+                png_log = "PNG lossless (tuned-more)";
+            }
+            tasks[idx] = (fp_encode_task){
+                .image = &image,
+                .quality = png_quality,
+                .label = png_label,
+                .log_name = png_log,
+                .eta_key = task_eta_keys[idx],
+                .output = &result->outputs[idx],
+                .encode = png_encoder,
+                .job = job,
+                .failure_status = -2,
+                .failure_message = "png_compress_error",
+                .work_units = work_units,
+                .tune_direction = png_tune,
+                .format = "png",
+            };
+            task_count++;
         }
-        tasks[idx] = (fp_encode_task){
-            .image = &image,
-            .quality = png_quality,
-            .label = png_label,
-            .log_name = png_log,
-            .eta_key = task_eta_keys[idx],
-            .output = &result->outputs[idx],
-            .encode = png_encoder,
-            .job = job,
-            .failure_status = -2,
-            .failure_message = "png_compress_error",
-            .work_units = work_units,
-            .tune_direction = png_tune,
-            .format = "png",
-        };
-        task_count++;
-    }
 
-    if (fp_should_run_task(job, "png", pngquant_label)) {
-        size_t idx = task_count;
-        worker_eta_make_key(task_eta_keys[idx], sizeof(task_eta_keys[idx]), "png_quant", work_units);
-        tasks[idx] = (fp_encode_task){
-            .image = &image,
-            .quality = pngquant_colors,
-            .label = pngquant_label,
-            .log_name = pngquant_tune != 0 ? "PNG pngquant (tuned)" : "PNG pngquant q80",
-            .eta_key = task_eta_keys[idx],
-            .output = &result->outputs[idx],
-            .encode = fp_worker_png_quant,
-            .job = job,
-            .failure_status = -5,
-            .failure_message = "pngquant_error",
-            .work_units = work_units,
-            .tune_direction = pngquant_tune,
-            .format = "png",
-        };
-        task_count++;
-    }
+        if (fp_should_run_task(job, "png", pngquant_label)) {
+            size_t idx = task_count;
+            worker_eta_make_key(task_eta_keys[idx], sizeof(task_eta_keys[idx]), "png_quant", work_units);
+            tasks[idx] = (fp_encode_task){
+                .image = &image,
+                .quality = pngquant_colors,
+                .label = pngquant_label,
+                .log_name = pngquant_tune != 0 ? "PNG pngquant (tuned)" : "PNG pngquant q80",
+                .eta_key = task_eta_keys[idx],
+                .output = &result->outputs[idx],
+                .encode = fp_worker_png_quant,
+                .job = job,
+                .failure_status = -5,
+                .failure_message = "pngquant_error",
+                .work_units = work_units,
+                .tune_direction = pngquant_tune,
+                .format = "png",
+            };
+            task_count++;
+        }
 
-    if (fp_should_run_task(job, "webp", webp_label)) {
-        size_t idx = task_count;
-        worker_eta_make_key(task_eta_keys[idx], sizeof(task_eta_keys[idx]), "webp_high", work_units);
-        tasks[idx] = (fp_encode_task){
-            .image = &image,
-            .quality = webp_quality,
-            .label = webp_label,
-            .log_name = webp_tune != 0 ? "WEBP high (tuned)" : "WEBP high",
-            .eta_key = task_eta_keys[idx],
-            .output = &result->outputs[idx],
-            .encode = fp_worker_webp_encode,
-            .job = job,
-            .failure_status = -3,
-            .failure_message = "webp_compress_error",
-            .work_units = work_units,
-            .tune_direction = webp_tune,
-            .format = "webp",
-        };
-        task_count++;
-    }
+        if (fp_should_run_task(job, "webp", webp_label)) {
+            size_t idx = task_count;
+            worker_eta_make_key(task_eta_keys[idx], sizeof(task_eta_keys[idx]), "webp_high", work_units);
+            tasks[idx] = (fp_encode_task){
+                .image = &image,
+                .quality = webp_quality,
+                .label = webp_label,
+                .log_name = webp_tune != 0 ? "WEBP high (tuned)" : "WEBP high",
+                .eta_key = task_eta_keys[idx],
+                .output = &result->outputs[idx],
+                .encode = fp_worker_webp_encode,
+                .job = job,
+                .failure_status = -3,
+                .failure_message = "webp_compress_error",
+                .work_units = work_units,
+                .tune_direction = webp_tune,
+                .format = "webp",
+            };
+            task_count++;
+        }
 
-    if (fp_should_run_task(job, "avif", avif_label)) {
-        size_t idx = task_count;
-        worker_eta_make_key(task_eta_keys[idx], sizeof(task_eta_keys[idx]), "avif_medium", work_units);
-        tasks[idx] = (fp_encode_task){
-            .image = &image,
-            .quality = avif_quality,
-            .label = avif_label,
-            .log_name = avif_tune != 0 ? "AVIF medium (tuned)" : "AVIF medium",
-            .eta_key = task_eta_keys[idx],
-            .output = &result->outputs[idx],
-            .encode = fp_worker_avif_encode,
-            .job = job,
-            .failure_status = -4,
-            .failure_message = "avif_compress_error",
-            .work_units = work_units,
-            .tune_direction = avif_tune,
-            .format = "avif",
-        };
-        task_count++;
+        if (fp_should_run_task(job, "avif", avif_label)) {
+            size_t idx = task_count;
+            worker_eta_make_key(task_eta_keys[idx], sizeof(task_eta_keys[idx]), "avif_medium", work_units);
+            tasks[idx] = (fp_encode_task){
+                .image = &image,
+                .quality = avif_quality,
+                .label = avif_label,
+                .log_name = avif_tune != 0 ? "AVIF medium (tuned)" : "AVIF medium",
+                .eta_key = task_eta_keys[idx],
+                .output = &result->outputs[idx],
+                .encode = fp_worker_avif_encode,
+                .job = job,
+                .failure_status = -4,
+                .failure_message = "avif_compress_error",
+                .work_units = work_units,
+                .tune_direction = avif_tune,
+                .format = "avif",
+            };
+            task_count++;
+        }
     }
 
     if (task_count == 0) {
@@ -451,7 +603,8 @@ static fp_result *fp_worker_handle_job(fp_job *job) {
     }
 
     pthread_t threads[task_count];
-    bool started[4] = {0};
+    bool started[FP_MAX_OUTPUTS];
+    memset(started, 0, sizeof(started));
     for (size_t i = 0; i < task_count; ++i) {
         if (pthread_create(&threads[i], NULL, fp_encode_task_run, &tasks[i]) == 0) {
             started[i] = true;

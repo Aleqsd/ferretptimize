@@ -4,3 +4,4 @@ ferret_eta.dat
 src/*.o
 tests/*.o
 tests/run_tests
+.env

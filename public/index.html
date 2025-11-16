@@ -3,12 +3,21 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="google-client-id" content="YOUR_GOOGLE_CLIENT_ID" />
   <title>Superfast image compressor</title>
   <link rel="stylesheet" href="/style.css" />
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 <body>
   <div class="glow"></div>
   <main class="app">
+    <div class="login-nav">
+      <div class="login-actions" aria-label="Social login">
+        <div id="google-login" class="pill login google" role="button">Login with Google</div>
+        <button class="pill login facebook" type="button">Login with Facebook</button>
+      </div>
+    </div>
+
     <header class="hero">
       <p class="eyebrow">ferretptimize</p>
       <h1><a href="/" class="hero-logo-link" aria-label="Go to homepage"><img src="/assets/logo.png" alt="ferretptimize mark" class="hero-logo" /></a> Superfast image compressor</h1>
@@ -55,6 +64,35 @@
         </header>
         <ul id="metrics-list"></ul>
       </section>
+    </section>
+
+    <section class="expert-highlight">
+      <div class="section-header">
+        <h2>✨ Expert Mode</h2>
+        <p class="meta">Advanced tier (API, batch, trim/crop)</p>
+      </div>
+      <div class="expert-grid">
+        <article class="expert-card subtle">
+          <h3>API + Keys</h3>
+          <p>Server-to-server uploads with JWT/API keys for CI and pipelines.</p>
+        </article>
+        <article class="expert-card subtle">
+          <h3>Tunables</h3>
+          <p>Dial PNG/WebP/AVIF quality, compression levels, and outputs.</p>
+        </article>
+        <article class="expert-card subtle">
+          <h3>Multi-image + Trim/Crop</h3>
+          <p>Batch uploads with whitespace trim and bounding-box crop before encode.</p>
+        </article>
+        <article class="expert-card subtle">
+          <h3>Auth & Billing</h3>
+          <p>Google/Facebook login with Stripe monthly/annual plans.</p>
+        </article>
+        <article class="expert-card subtle">
+          <h3>Roadmap</h3>
+          <p>JPEG/HEIC later; see <a href="/Features.md" target="_blank" rel="noopener">Features.md</a>.</p>
+        </article>
+      </div>
     </section>
   </main>
   <script src="/app.js" defer></script>

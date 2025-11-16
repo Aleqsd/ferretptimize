@@ -4,10 +4,32 @@
 #include <stdint.h>
 #include <time.h>
 
-#define FP_MAX_OUTPUTS 4
+#define FP_MAX_OUTPUTS 6
 #define FP_FILENAME_MAX 256
 
 struct fp_progress_channel;
+
+typedef struct {
+    char format[8];
+    char label[32];
+    int quality;
+    int compression_level;
+    int lossless;
+    int speed;
+} fp_requested_output;
+
+typedef struct {
+    int enabled;
+    float tolerance;
+} fp_trim_options;
+
+typedef struct {
+    int enabled;
+    int x;
+    int y;
+    int width;
+    int height;
+} fp_crop_options;
 
 struct fp_encoded_image {
     char format[8];
@@ -31,6 +53,11 @@ typedef struct {
     char tune_format[8];
     char tune_label[32];
     int tune_direction;
+    int is_expert;
+    fp_requested_output requested_outputs[FP_MAX_OUTPUTS];
+    size_t requested_output_count;
+    fp_trim_options trim_options;
+    fp_crop_options crop_options;
 } fp_job;
 
 typedef struct {
@@ -42,6 +69,12 @@ typedef struct {
     char message[128];
     struct timespec start_ts;
     struct timespec end_ts;
+    unsigned input_width;
+    unsigned input_height;
+    unsigned output_width;
+    unsigned output_height;
+    int trim_applied;
+    int crop_applied;
 } fp_result;
 
 void fp_free_result(fp_result *result);

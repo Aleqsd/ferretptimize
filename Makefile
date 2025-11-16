@@ -10,7 +10,7 @@ SRC := $(wildcard src/*.c)
 OBJ := $(SRC:.c=.o)
 BIN := ferretptimize
 
-TEST_OBJ := tests/test_queue.o
+TEST_OBJ := tests/test_queue.o tests/test_image_ops.o
 TEST_BIN := tests/run_tests
 AUTOTEST_SCRIPT := tests/autotest.sh
 RUNNER := scripts/run_with_browser.sh
@@ -21,7 +21,7 @@ all: $(BIN)
 $(BIN): $(OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 
-$(TEST_BIN): $(TEST_OBJ) src/queue.o
+$(TEST_BIN): $(TEST_OBJ) src/queue.o src/image_ops.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 
 tests/%.o: tests/%.c

@@ -58,6 +58,9 @@ const resultCards = new Map();
 let currentJobContext = null;
 let activeEventSource = null;
 let jobNonce = 0;
+let originalFile = null;
+let originalFileBuffer = null;
+const MAX_FILE_SIZE = 100 * 1024 * 1024; // 100 MB
 
 const preventDefaults = (event) => {
   event.preventDefault();
@@ -97,6 +100,12 @@ function handleFile(file) {
     alert('Please upload a PNG file.');
     return;
   }
+  if (file.size > MAX_FILE_SIZE) {
+    alert('Please upload a PNG that is 100 MB or smaller.');
+    return;
+  }
+  originalFile = file;
+  originalFileBuffer = null;
   const jobId = nextJobId();
   showOriginal(file);
   seedResultPlaceholders({ filename: file.name, bytes: file.size, jobId });
@@ -213,6 +222,23 @@ function formatDuration(ms) {
     return `${(ms / 1000).toFixed(2)} s`;
   }
   return `${ms.toFixed(1)} ms`;
+}
+
+function nowMs() {
+  return typeof performance !== 'undefined' && typeof performance.now === 'function'
+    ? performance.now()
+    : Date.now();
+}
+
+async function loadOriginalBuffer() {
+  if (originalFileBuffer) {
+    return originalFileBuffer;
+  }
+  if (!originalFile) {
+    return null;
+  }
+  originalFileBuffer = await originalFile.arrayBuffer();
+  return originalFileBuffer;
 }
 
 async function upload(file, jobId) {
@@ -401,13 +427,9 @@ function createResultCard(descriptor) {
   preview.className = 'result-preview loading';
   const previewStage = document.createElement('div');
   previewStage.className = 'result-preview-stage';
-  const spinner = document.createElement('div');
-  spinner.className = 'spinner';
-  spinner.setAttribute('aria-hidden', 'true');
   const placeholder = document.createElement('p');
   placeholder.className = 'result-placeholder-text';
-  placeholder.textContent = 'Encoding…';
-  previewStage.appendChild(spinner);
+  placeholder.textContent = 'Estimating ETA…';
   previewStage.appendChild(placeholder);
   preview.appendChild(previewStage);
 
@@ -422,11 +444,45 @@ function createResultCard(descriptor) {
     }
   });
 
+  const actions = document.createElement('div');
+  actions.className = 'result-actions';
+
+  const moreButton = document.createElement('button');
+  moreButton.type = 'button';
+  moreButton.className = 'result-action-btn';
+  moreButton.textContent = 'Compress more';
+  moreButton.title = 'Push compression harder for this output';
+  moreButton.disabled = true;
+  moreButton.addEventListener('click', () => handleCompressionFeedback('more', descriptor));
+
+  const lessButton = document.createElement('button');
+  lessButton.type = 'button';
+  lessButton.className = 'result-action-btn ghost';
+  lessButton.textContent = 'Compress less';
+  lessButton.title = 'Ease compression to preserve fidelity';
+  lessButton.disabled = true;
+  lessButton.addEventListener('click', () => handleCompressionFeedback('less', descriptor));
+
+  const revertButton = document.createElement('button');
+  revertButton.type = 'button';
+  revertButton.className = 'result-action-btn ghost hidden';
+  revertButton.textContent = 'Restore original';
+  revertButton.title = 'Go back to the first compression result';
+  revertButton.disabled = true;
+  revertButton.addEventListener('click', () => handleRevertToOriginal(descriptor));
+
+  download.classList.add('result-download');
+
+  actions.appendChild(download);
+  actions.appendChild(moreButton);
+  actions.appendChild(lessButton);
+  actions.appendChild(revertButton);
+
   card.appendChild(title);
   card.appendChild(meta);
   card.appendChild(gauge);
   card.appendChild(preview);
-  card.appendChild(download);
+  card.appendChild(actions);
   resultsEl.appendChild(card);
   return {
     card,
@@ -439,7 +495,20 @@ function createResultCard(descriptor) {
     titleEl: title,
     placeholderEl: placeholder,
     descriptor,
+    actions,
+    moreButton,
+    lessButton,
+    revertButton,
+    initialResult: null,
+    initialBaseline: null,
+    tuneLocked: false,
+    lastBytes: null,
     ghostFrame: null,
+    etaProgress: null,
+    etaProgressFill: null,
+    etaProgressText: null,
+    etaStartTime: null,
+    etaTargetMs: null,
   };
 }
 
@@ -451,37 +520,91 @@ function getEtaMs(descriptor) {
   return descriptor?.etaMs || 1500;
 }
 
-function startGhostProgress(entry, descriptor) {
-  if (!entry || !descriptor) return;
-  const eta = getEtaMs(descriptor);
-  const update = () => {
-    if (!currentJobContext?.startTime || entry.card.classList.contains('ready')) {
-      entry.ghostFrame = null;
-      return;
-    }
-    const elapsed = Date.now() - currentJobContext.startTime;
-    const percent = Math.min(95, Math.max(5, (elapsed / eta) * 100));
-    entry.gaugeFill.style.width = `${percent.toFixed(1)}%`;
-    entry.gaugeFill.classList.remove('negative');
-    entry.gauge.title = `Crunching… ~${percent.toFixed(0)}%`;
-    if (entry.placeholderEl) {
-      entry.placeholderEl.textContent = `Crunching… ~${percent.toFixed(0)}%`;
-    }
-    entry.ghostFrame = requestAnimationFrame(update);
-  };
-  stopGhostProgress(entry);
-  entry.ghostFrame = requestAnimationFrame(update);
+function ensureEtaProgress(entry) {
+  if (entry.etaProgress && entry.etaProgressFill && entry.etaProgressText) {
+    return;
+  }
+  const etaProgress = document.createElement('div');
+  etaProgress.className = 'eta-progress';
+  const track = document.createElement('div');
+  track.className = 'eta-progress-track';
+  const fill = document.createElement('div');
+  fill.className = 'eta-progress-fill';
+  track.appendChild(fill);
+  const label = document.createElement('p');
+  label.className = 'eta-progress-text';
+  label.textContent = 'Estimating ETA…';
+  etaProgress.appendChild(track);
+  etaProgress.appendChild(label);
+  entry.etaProgress = etaProgress;
+  entry.etaProgressFill = fill;
+  entry.etaProgressText = label;
 }
 
-function stopGhostProgress(entry) {
+function updateEtaProgress(entry, percent = 0, remainingMs = 0, message = 'Crunching…') {
+  if (!entry) return;
+  const clamped = Math.max(0, Math.min(100, percent));
+  ensureEtaProgress(entry);
+  if (entry.etaProgressFill) {
+    entry.etaProgressFill.style.width = `${clamped}%`;
+  }
+  const remainingText = Number.isFinite(remainingMs) && remainingMs > 0
+    ? `${formatDuration(Math.max(remainingMs, 0))} left`
+    : 'finishing…';
+  const label = `${clamped.toFixed(0)}% · ${remainingText}`;
+  if (entry.etaProgressText) {
+    entry.etaProgressText.textContent = label;
+  }
+  if (entry.placeholderEl) {
+    entry.placeholderEl.textContent = message;
+  }
+}
+
+function startGhostProgress(entry, descriptor, message = 'Crunching…') {
+  if (!entry || !descriptor) return;
+  stopGhostProgress(entry);
+  ensureEtaProgress(entry);
+  if (!entry.placeholderEl) {
+    const placeholder = document.createElement('p');
+    placeholder.className = 'result-placeholder-text';
+    placeholder.textContent = message;
+    entry.placeholderEl = placeholder;
+  }
+  entry.preview.classList.add('loading');
+  entry.previewStage.innerHTML = '';
+  entry.previewStage.appendChild(entry.etaProgress);
+  entry.previewStage.appendChild(entry.placeholderEl);
+
+  entry.gaugeFill.style.width = '0%';
+  entry.gaugeFill.classList.remove('negative');
+  entry.gauge.title = 'Crunching…';
+
+  const etaMs = Math.max(300, getEtaMs(descriptor));
+  entry.etaTargetMs = etaMs;
+  entry.etaStartTime = nowMs();
+  const tick = () => {
+    const elapsed = nowMs() - entry.etaStartTime;
+    const remaining = Math.max(etaMs - elapsed, 0);
+    const predicted = etaMs > 0 ? Math.min(99, (elapsed / etaMs) * 100) : 10;
+    updateEtaProgress(entry, predicted, remaining, message);
+    entry.ghostFrame = requestAnimationFrame(tick);
+  };
+  updateEtaProgress(entry, 5, etaMs, message);
+  entry.ghostFrame = requestAnimationFrame(tick);
+}
+
+function stopGhostProgress(entry, complete = false) {
   if (!entry) return;
   if (entry.ghostFrame) {
     cancelAnimationFrame(entry.ghostFrame);
     entry.ghostFrame = null;
   }
-  if (entry.placeholderEl) {
-    entry.placeholderEl.textContent = 'Encoding…';
+  if (complete) {
+    updateEtaProgress(entry, 100, 0, 'Wrapping up…');
   }
+  entry.etaStartTime = null;
+  entry.etaTargetMs = null;
+  entry.gaugeFill.style.width = '0%';
   entry.gauge.title = '';
 }
 
@@ -503,15 +626,19 @@ function ensureResultCard(result) {
 
 function populateResultCard(result, baselineBytes, filename) {
   const entry = ensureResultCard(result);
+  const previousBytes = entry.lastBytes;
   const alreadyReady = entry.card.classList.contains('ready');
   stopGhostProgress(entry);
   entry.card.classList.remove('pending', 'error');
   entry.card.classList.add('ready');
 
-  const savings = baselineBytes ? ((baselineBytes - result.bytes) / baselineBytes) * 100 : 0;
-  const savingsText = savings ? ` (${savings.toFixed(1)}% smaller)` : '';
-  const statLine = `${formatBytes(result.bytes)}${savingsText}`;
-  entry.meta.textContent = statLine;
+  if (!entry.initialResult) {
+    entry.initialResult = { ...result };
+    entry.initialBaseline = baselineBytes;
+  }
+
+  const metaLine = formatResultMeta(entry, result, baselineBytes, previousBytes);
+  entry.meta.textContent = metaLine;
   entry.titleEl.title = formatResultTooltip(result, baselineBytes);
 
   const dataUri = `data:${result.mime};base64,${result.data}`;
@@ -528,6 +655,13 @@ function populateResultCard(result, baselineBytes, filename) {
   entry.download.textContent = 'Download';
   entry.download.classList.remove('disabled');
   entry.download.removeAttribute('aria-disabled');
+  toggleActionButtons(entry, true);
+  entry.lastBytes = result.bytes;
+  entry.tuneLocked = Boolean(result.tuning);
+  if (entry.tuneLocked) {
+    toggleTuneButtons(entry, false);
+    toggleRevertButton(entry, true);
+  }
 
   const percent = baselineBytes ? ((baselineBytes - result.bytes) / baselineBytes) * 100 : 0;
   const clamped = Math.max(0, Math.min(100, percent < 0 ? 0 : percent));
@@ -544,7 +678,7 @@ function populateResultCard(result, baselineBytes, filename) {
     const durationText = typeof result.durationMs === 'number' && result.durationMs >= 0
       ? ` in ${formatDuration(result.durationMs)}`
       : '';
-    appendLog(`ready <span>${result.format.toUpperCase()} – ${result.label}</span> → ${statLine}${durationText}`);
+    appendLog(`ready <span>${result.format.toUpperCase()} – ${result.label}</span> → ${metaLine}${durationText}`);
     updateEtaStore(result);
     if (currentJobContext?.pendingKeys) {
       currentJobContext.pendingKeys.delete(resultKey(result.format, result.label));
@@ -579,6 +713,7 @@ function markResultCardsAsError(message) {
     entry.download.classList.add('disabled');
     entry.download.setAttribute('aria-disabled', 'true');
     entry.download.removeAttribute('href');
+    toggleActionButtons(entry, false);
   });
 }
 
@@ -590,6 +725,11 @@ function formatResultTooltip(result, baselineBytes) {
   const durationLine = typeof result.durationMs === 'number'
     ? `Finished in ${formatDuration(result.durationMs)}`
     : null;
+  const tuningLine = result.tuning === 'more'
+    ? 'Tuning: requested smaller output'
+    : result.tuning === 'less'
+      ? 'Tuning: requested more detail'
+      : null;
   return [
     `${(result.format || '').toUpperCase()} – ${result.label || 'variant'}`,
     description,
@@ -597,6 +737,7 @@ function formatResultTooltip(result, baselineBytes) {
     `Profile: ${result.label || 'n/a'}`,
     `Output: ${formatBytes(result.bytes)} (${percent}% vs ${baseline})`,
     durationLine,
+    tuningLine,
   ].filter(Boolean).join('\n');
 }
 
@@ -614,12 +755,177 @@ function updateEtaStore(result) {
   }
 }
 
-function updateEtaStore(result) {
-  const key = resultKey(result.format, result.label);
-  if (!key) return;
-  const avg = typeof result.avgDurationMs === 'number' && result.avgDurationMs > 0
-    ? result.avgDurationMs
-    : (typeof result.durationMs === 'number' && result.durationMs > 0 ? result.durationMs : null);
-  if (!avg) return;
-  etaStore.set(key, avg);
+function toggleActionButtons(entry, enabled) {
+  if (!entry) return;
+  [entry.moreButton, entry.lessButton].forEach((button) => {
+    if (!button) return;
+    button.disabled = entry.tuneLocked ? true : !enabled;
+  });
+}
+
+function toggleTuneButtons(entry, show) {
+  if (!entry) return;
+  [entry.moreButton, entry.lessButton].forEach((button) => {
+    if (!button) return;
+    button.classList.toggle('hidden', !show);
+    button.disabled = !show;
+  });
+}
+
+function toggleRevertButton(entry, show) {
+  if (!entry?.revertButton) return;
+  entry.revertButton.classList.toggle('hidden', !show);
+  entry.revertButton.disabled = !show;
+}
+
+function buildTuneDeltaLog(descriptor, beforeBytes, afterBytes, intentLabel) {
+  const formatText = descriptor?.format ? descriptor.format.toUpperCase() : 'OUTPUT';
+  const labelText = descriptor?.label ? ` – ${descriptor.label}` : '';
+  if (!Number.isFinite(beforeBytes) || beforeBytes <= 0) {
+    return `retuned <span>${formatText}${labelText}</span> for ${intentLabel}`;
+  }
+  const delta = afterBytes - beforeBytes;
+  const percent = beforeBytes > 0 ? (delta / beforeBytes) * 100 : 0;
+  const arrow = delta === 0 ? 'no change' : delta < 0 ? 'smaller' : 'larger';
+  const percentText = `${Math.abs(percent).toFixed(1)}% ${arrow}`;
+  return `retuned <span>${formatText}${labelText}</span>: ${formatBytes(beforeBytes)} → ${formatBytes(afterBytes)} (${percentText})`;
+}
+
+function computeTuneDelta(beforeBytes, afterBytes, tuning) {
+  if (!tuning || !Number.isFinite(beforeBytes) || beforeBytes <= 0 || !Number.isFinite(afterBytes)) {
+    return '';
+  }
+  const delta = afterBytes - beforeBytes;
+  const percent = beforeBytes ? (delta / beforeBytes) * 100 : 0;
+  const direction = delta === 0 ? 'no change' : delta < 0 ? 'smaller' : 'larger';
+  return ` · ${formatBytes(beforeBytes)} → ${formatBytes(afterBytes)} (${Math.abs(percent).toFixed(1)}% ${direction})`;
+}
+
+function formatResultMeta(entry, result, baselineBytes, previousBytes) {
+  const original = entry?.initialBaseline || baselineBytes || currentJobContext?.inputBytes || 0;
+  if (result.tuning && original > 0) {
+    const parts = [`${formatBytes(original)} (original)`];
+    if (Number.isFinite(previousBytes) && previousBytes > 0 && previousBytes !== original) {
+      const prevPct = ((original - previousBytes) / original) * 100;
+      const prefix = prevPct < 0 ? '⚠️ ' : '';
+      parts.push(`→ ${prefix}${formatBytes(previousBytes)} (${prevPct.toFixed(1)}% smaller)`);
+    }
+    const curPct = ((original - result.bytes) / original) * 100;
+    const curPrefix = curPct < 0 ? '⚠️ ' : '';
+    parts.push(`→ ${curPrefix}${formatBytes(result.bytes)} (${curPct.toFixed(1)}% smaller)`);
+    return parts.join(' ');
+  }
+  const savings = baselineBytes ? ((baselineBytes - result.bytes) / baselineBytes) * 100 : 0;
+  const savingsText = savings ? ` (${savings.toFixed(1)}% smaller)` : '';
+  return `${formatBytes(result.bytes)}${savingsText}`;
+}
+
+function resetResultCardForRetune(entry, intentLabel = '') {
+  if (!entry) return;
+  stopGhostProgress(entry);
+  entry.card.classList.remove('ready', 'error');
+  entry.card.classList.add('pending');
+  entry.meta.textContent = intentLabel ? `Retuning for ${intentLabel}…` : 'Retuning…';
+  entry.preview.classList.add('loading');
+  entry.previewStage.innerHTML = '';
+  const placeholder = entry.placeholderEl || document.createElement('p');
+  placeholder.className = 'result-placeholder-text';
+  placeholder.textContent = intentLabel ? `Retuning for ${intentLabel}…` : 'Encoding…';
+  entry.placeholderEl = placeholder;
+  startGhostProgress(entry, entry.descriptor, placeholder.textContent);
+  entry.download.classList.add('disabled');
+  entry.download.setAttribute('aria-disabled', 'true');
+  entry.download.removeAttribute('href');
+  entry.download.textContent = 'Preparing…';
+  toggleRevertButton(entry, false);
+  entry.gaugeFill.style.width = '0%';
+  entry.gaugeFill.classList.remove('negative');
+  entry.gauge.title = 'Crunching…';
+}
+
+function handleRevertToOriginal(descriptor = {}) {
+  const targetKey = resultKey(descriptor.format, descriptor.label);
+  const entry = resultCards.get(targetKey);
+  if (!entry || !entry.initialResult) return;
+  entry.tuneLocked = false;
+  toggleActionButtons(entry, true);
+  toggleRevertButton(entry, false);
+  toggleTuneButtons(entry, true);
+  const baseline = entry.initialBaseline || currentJobContext?.inputBytes || 0;
+  populateResultCard({ ...entry.initialResult }, baseline, entry.initialResult.filename || currentJobContext?.filename || '');
+}
+
+async function handleCompressionFeedback(direction, descriptor = {}) {
+  const targetKey = resultKey(descriptor.format, descriptor.label);
+  const entry = resultCards.get(targetKey);
+  if (!descriptor?.format || !entry) {
+    appendLog('error → No matching output to retune.');
+    return;
+  }
+  if (!originalFile) {
+    appendLog('error → Original file missing; upload again to retune.');
+    alert('Upload a PNG before asking for more or less compression.');
+    return;
+  }
+
+  const intentLabel = direction === 'more' ? 'smaller file' : 'more detail';
+  appendLog(`retuning <span>${descriptor.format?.toUpperCase() || 'OUTPUT'} – ${descriptor.label || ''}</span> for ${intentLabel}`);
+  resetResultCardForRetune(entry, intentLabel);
+  entry.tuneLocked = true;
+  toggleActionButtons(entry, false);
+  toggleTuneButtons(entry, false);
+
+  try {
+    const buffer = await loadOriginalBuffer();
+    if (!buffer) {
+      throw new Error('Original file unavailable.');
+    }
+    const jobId = nextJobId();
+    const response = await fetch('/api/compress', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'X-Filename': originalFile.name,
+        'X-Job-ID': String(jobId),
+        'X-Tune-Format': descriptor.format,
+        ...(descriptor.label ? { 'X-Tune-Label': descriptor.label } : {}),
+        'X-Tune-Intent': direction,
+      },
+      body: buffer,
+    });
+
+    let payload = null;
+    try {
+      payload = await response.json();
+    } catch (error) {
+      if (!response.ok) {
+        throw new Error('Failed to parse server response.');
+      }
+      throw error;
+    }
+    if (!response.ok) {
+      throw new Error(payload?.message || 'Compression failed.');
+    }
+
+    const baseline = typeof payload.inputBytes === 'number' && payload.inputBytes > 0
+      ? payload.inputBytes
+      : currentJobContext?.inputBytes || originalFile.size || 0;
+    const filename = payload.filename || currentJobContext?.filename || originalFile.name || '';
+    const updated = (payload.results || []).find((result) => resultKey(result.format, result.label) === targetKey);
+    if (updated) {
+      const previousBytes = entry.lastBytes;
+      populateResultCard(updated, baseline, filename);
+      appendLog(buildTuneDeltaLog(descriptor, previousBytes, updated.bytes, intentLabel));
+      toggleRevertButton(entry, true);
+      appendLog(`ready <span>${descriptor.format?.toUpperCase() || 'OUTPUT'} – ${descriptor.label || ''}</span> tuned for ${intentLabel}`);
+    } else {
+      throw new Error('Tuned output missing from server response.');
+    }
+  } catch (error) {
+    entry.meta.textContent = error.message || 'Unable to retune output.';
+    appendLog(`error → ${error.message || error}`);
+  } finally {
+    toggleActionButtons(entry, true);
+    entry.card.classList.remove('pending');
+  }
 }

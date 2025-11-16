@@ -235,6 +235,7 @@ fp_compress_code fp_compress_png_level(const fp_rgba_image *image,
     output->label[sizeof(output->label) - 1] = '\0';
     output->mime[sizeof(output->mime) - 1] = '\0';
     output->extension[sizeof(output->extension) - 1] = '\0';
+    output->tuning[0] = '\0';
 
     return FP_COMPRESS_OK;
 }
@@ -402,6 +403,7 @@ static fp_compress_code fp_encode_png_palette(const uint8_t *indexed,
     output->label[sizeof(output->label) - 1] = '\0';
     output->mime[sizeof(output->mime) - 1] = '\0';
     output->extension[sizeof(output->extension) - 1] = '\0';
+    output->tuning[0] = '\0';
 
     return FP_COMPRESS_OK;
 }

@@ -14,6 +14,7 @@ TEST_OBJ := tests/test_queue.o
 TEST_BIN := tests/run_tests
 AUTOTEST_SCRIPT := tests/autotest.sh
 RUNNER := scripts/run_with_browser.sh
+DEPS := $(wildcard include/*.h)
 
 all: $(BIN)
 
@@ -25,6 +26,9 @@ $(TEST_BIN): $(TEST_OBJ) src/queue.o
 
 tests/%.o: tests/%.c
 	$(CC) $(CFLAGS) -Iinclude -c -o $@ $<
+
+$(OBJ): $(DEPS)
+$(TEST_OBJ): $(DEPS)
 
 install: $(BIN)
 	install -d $(DESTDIR)$(BINDIR)

@@ -409,12 +409,14 @@ int fp_progress_emit_output(fp_progress_channel *channel,
     char *label = fp_progress_json_escape(output->label);
     char *mime = fp_progress_json_escape(output->mime);
     char *extension = fp_progress_json_escape(output->extension);
+    char *tuning = fp_progress_json_escape(output->tuning);
     char *data = fp_progress_base64_encode(output->data, output->size);
-    if (!format || !label || !mime || !extension || !data) {
+    if (!format || !label || !mime || !extension || !data || !tuning) {
         free(format);
         free(label);
         free(mime);
         free(extension);
+        free(tuning);
         free(data);
         return -1;
     }
@@ -423,18 +425,20 @@ int fp_progress_emit_output(fp_progress_channel *channel,
     int prefix_len = snprintf(NULL,
                               0,
                               "{\"jobId\":%llu,\"type\":\"result\",\"format\":%s,\"label\":%s,"
-                              "\"bytes\":%zu,\"mime\":%s,\"extension\":%s,\"data\":\"",
+                              "\"bytes\":%zu,\"mime\":%s,\"extension\":%s,\"tuning\":%s,\"data\":\"",
                               (unsigned long long)channel->job_id,
                               format,
                               label,
                               output->size,
                               mime,
-                              extension);
+                              extension,
+                              tuning);
     if (prefix_len < 0) {
         free(format);
         free(label);
         free(mime);
         free(extension);
+        free(tuning);
         free(data);
         return -1;
     }
@@ -465,6 +469,7 @@ int fp_progress_emit_output(fp_progress_channel *channel,
         free(label);
         free(mime);
         free(extension);
+        free(tuning);
         free(data);
         return -1;
     }
@@ -477,6 +482,7 @@ int fp_progress_emit_output(fp_progress_channel *channel,
     free(label);
     free(mime);
     free(extension);
+    free(tuning);
     free(data);
 
     return fp_progress_emit(channel, FP_PROGRESS_EVENT_OUTPUT, "result", payload);

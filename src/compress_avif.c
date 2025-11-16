@@ -76,6 +76,7 @@ fp_compress_code fp_compress_avif(const fp_rgba_image *image,
     output->label[sizeof(output->label) - 1] = '\0';
     output->mime[sizeof(output->mime) - 1] = '\0';
     output->extension[sizeof(output->extension) - 1] = '\0';
+    output->tuning[0] = '\0';
 
     return FP_COMPRESS_OK;
 }

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>ferretptimize</title>
+  <title>Superfast image compressor</title>
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
@@ -11,11 +11,12 @@
   <main class="app">
     <header class="hero">
       <p class="eyebrow">ferretptimize</p>
-      <h1><img src="/assets/logo.png" alt="ferretptimize mark" class="hero-logo" /> Zero-drag compression for builders</h1>
+      <h1><a href="/" class="hero-logo-link" aria-label="Go to homepage"><img src="/assets/logo.png" alt="ferretptimize mark" class="hero-logo" /></a> Superfast image compressor</h1>
       <p class="subtitle">
-        Drop in a PNG, let ferretptimize fan out four ultra-tight outputs in milliseconds.
-        Built for teams shipping high-performance frontends.
+        Drop a PNG and get four production-ready variants in milliseconds — C under the hood, tuned for minimal latency.
+        Built for frontend teams chasing max performance.
       </p>
+      <p class="disclaimer">We never store your images or personal data — files are processed just for your session.</p>
     </header>
 
     <section id="original" class="original hidden">
@@ -28,15 +29,22 @@
 
     <section id="results" class="results hidden"></section>
 
+    <section id="console" class="console hidden">
+      <header class="section-header">
+        <h2>📡 Event stream</h2>
+        <p class="meta">Real-time updates from the ferret cores.</p>
+      </header>
+      <div id="console-log" aria-live="polite" aria-atomic="false"></div>
+    </section>
+
     <section class="panels">
       <div id="drop-zone" class="drop-zone">
-        <div class="drop-icon">🌀</div>
+        <div class="drop-icon" aria-hidden="true"></div>
         <h2>📤 Dispatch a PNG</h2>
         <p>Drag & drop or click browse – ferretptimize handles the rest.</p>
         <input id="file-input" type="file" accept="image/png" hidden />
         <div class="drop-actions">
           <button id="browse">Browse</button>
-          <span class="hint">Content-Type: application/octet-stream</span>
         </div>
       </div>
 
@@ -47,14 +55,6 @@
         </header>
         <ul id="metrics-list"></ul>
       </section>
-    </section>
-
-    <section id="console" class="console hidden">
-      <header class="section-header">
-        <h2>📡 Event stream</h2>
-        <p class="meta">Real-time updates from the ferret cores.</p>
-      </header>
-      <div id="console-log" aria-live="polite" aria-atomic="false"></div>
     </section>
   </main>
   <script src="/app.js" defer></script>

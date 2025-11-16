@@ -14,6 +14,7 @@ struct fp_encoded_image {
     char label[32];
     char mime[32];
     char extension[8];
+    char tuning[8];
     uint8_t *data;
     size_t size;
 };
@@ -27,6 +28,9 @@ typedef struct {
     size_t size;
     struct timespec enqueue_ts;
     struct fp_progress_channel *progress;
+    char tune_format[8];
+    char tune_label[32];
+    int tune_direction;
 } fp_job;
 
 typedef struct {

@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -26,18 +27,37 @@
 #include "progress.h"
 
 #define FP_MAX_HEADER (64 * 1024)
-#define FP_MAX_UPLOAD (32 * 1024 * 1024)
+#define FP_MAX_UPLOAD (100 * 1024 * 1024)
 #define FP_MIN_BUFFER 4096
 #define FP_SLEEP_NS 2000000
 
 static const char *FP_PUBLIC_ROOT = "public";
 static _Atomic uint64_t g_job_counter = 1;
 
+static bool fp_is_known_target(const char *format, const char *label) {
+    if (!format || !*format) {
+        return false;
+    }
+    if (strcasecmp(format, "png") == 0) {
+        return !label || strcasecmp(label, "lossless") == 0 || strcasecmp(label, "pngquant q80") == 0;
+    }
+    if (strcasecmp(format, "webp") == 0) {
+        return !label || strcasecmp(label, "high") == 0;
+    }
+    if (strcasecmp(format, "avif") == 0) {
+        return !label || strcasecmp(label, "medium") == 0;
+    }
+    return false;
+}
+
 typedef struct {
     char method[8];
     char path[256];
     char content_type[128];
     char filename[FP_FILENAME_MAX];
+    char tune_format[8];
+    char tune_label[32];
+    int tune_direction;
     size_t content_length;
     uint64_t client_job_id;
 } fp_http_request;
@@ -258,6 +278,16 @@ static int fp_parse_request(char *header_block, fp_http_request *request) {
             strncpy(request->filename, value, sizeof(request->filename) - 1);
         } else if (strcmp(name, "x-job-id") == 0) {
             request->client_job_id = strtoull(value, NULL, 10);
+        } else if (strcmp(name, "x-tune-format") == 0) {
+            strncpy(request->tune_format, value, sizeof(request->tune_format) - 1);
+        } else if (strcmp(name, "x-tune-label") == 0) {
+            strncpy(request->tune_label, value, sizeof(request->tune_label) - 1);
+        } else if (strcmp(name, "x-tune-intent") == 0) {
+            if (strncasecmp(value, "more", 4) == 0) {
+                request->tune_direction = 1;
+            } else if (strncasecmp(value, "less", 4) == 0) {
+                request->tune_direction = -1;
+            }
         }
     }
     return 0;
@@ -549,6 +579,8 @@ static int fp_send_result_payload(int fd, const fp_result *result, const char *f
             fp_buffer_append_json_string(&body, output.mime) != 0 ||
             FP_APPEND_LITERAL(&body, ",\"extension\":") != 0 ||
             fp_buffer_append_json_string(&body, output.extension) != 0 ||
+            FP_APPEND_LITERAL(&body, ",\"tuning\":") != 0 ||
+            fp_buffer_append_json_string(&body, output.tuning) != 0 ||
             FP_APPEND_LITERAL(&body, ",\"data\":") != 0 ||
             fp_buffer_append_json_string(&body, encoded) != 0 ||
             FP_APPEND_LITERAL(&body, "}") != 0) {
@@ -694,6 +726,9 @@ static int fp_handle_compress(int fd, const fp_http_request *request, uint8_t *b
     if (job->filename[0] == '\0') {
         snprintf(job->filename, sizeof(job->filename), "upload-%llu.png", (unsigned long long)job->id);
     }
+    strncpy(job->tune_format, request->tune_format, sizeof(job->tune_format) - 1);
+    strncpy(job->tune_label, request->tune_label, sizeof(job->tune_label) - 1);
+    job->tune_direction = request->tune_direction;
     char response_filename[FP_FILENAME_MAX];
     strncpy(response_filename, job->filename, sizeof(response_filename) - 1);
     response_filename[sizeof(response_filename) - 1] = '\0';
@@ -709,6 +744,19 @@ static int fp_handle_compress(int fd, const fp_http_request *request, uint8_t *b
     job->progress = progress_channel;
 
     fp_log_info("🧾 Enqueued job #%llu (%s, %zu bytes)", (unsigned long long)job_id, response_filename, job->size);
+    if (job->tune_direction != 0 && job->tune_format[0] != '\0') {
+        if (!fp_is_known_target(job->tune_format, job->tune_label)) {
+            fp_log_warn("🚫 Unknown tune target: %s / %s", job->tune_format, job->tune_label);
+            fp_free_job(job);
+            free(job);
+            fp_progress_emit_status(progress_channel, "error", "unknown_tune_target", 0.0, request->content_length);
+            fp_progress_close(progress_channel);
+            fp_progress_release(progress_channel);
+            return fp_send_json_error(fd, 400, "Unknown tune target");
+        }
+        const char *intent = job->tune_direction > 0 ? "smaller" : "more_detail";
+        fp_log_info("🎛️  Tuning request → %s (%s)", job->tune_format, intent);
+    }
 
     int pushed = 0;
     for (int attempt = 0; attempt < 5000 && !pushed; ++attempt) {
@@ -792,7 +840,7 @@ static void fp_handle_client(int client_fd, fp_queue *job_queue, fp_queue *resul
         if (request.content_length > FP_MAX_UPLOAD) {
             free(header_copy);
             free(header_buffer);
-            fp_send_json_error(client_fd, 413, "File too large");
+            fp_send_json_error(client_fd, 413, "File too large (max 100 MB)");
             return;
         }
         body = malloc(request.content_length);

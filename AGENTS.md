@@ -11,4 +11,4 @@
 |---------------|-------------|
 | `make`        | Compiles the ferretptimize server and compression pipeline with all dependencies. |
 | `make test`   | Builds and runs `tests/run_tests`, stress-testing the lock-free queue implementation. |
-| `make autotest` | Launches the server on localhost, uploads `tests/assets/test.png` via `curl`, and validates the JSON payload. |
+| `make autotest` | Launches the server on localhost, uploads a generated PNG via `curl`, and validates the JSON payload (keeps `tests/assets/test.png` for manual use). |

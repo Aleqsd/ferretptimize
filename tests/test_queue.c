@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <errno.h>
 
 #include "queue.h"
 
@@ -155,8 +156,51 @@ static void test_queue_mpmc(void) {
     free(seen);
 }
 
+static void test_queue_fifo_order(void) {
+    printf("\n🧪 [queue-fifo] Verifying basic FIFO ordering\n");
+    fp_queue *queue = fp_queue_create(2);
+    TEST_ASSERT(queue != NULL);
+
+    int a = 1, b = 2;
+    TEST_ASSERT(fp_queue_push(queue, &a) == 0);
+    TEST_ASSERT(fp_queue_push(queue, &b) == 0);
+
+    int *first = (int *)fp_queue_pop(queue);
+    int *second = (int *)fp_queue_pop(queue);
+
+    TEST_ASSERT(first && *first == 1);
+    TEST_ASSERT(second && *second == 2);
+    TEST_ASSERT(fp_queue_pop(queue) == NULL); // empty now
+
+    fp_queue_destroy(queue);
+    printf("✅ [queue-fifo] Basic FIFO push/pop passed\n");
+}
+
+static void test_queue_capacity_backpressure(void) {
+    printf("\n🧪 [queue-capacity] Ensuring push fails when full\n");
+    fp_queue *queue = fp_queue_create(2);
+    TEST_ASSERT(queue != NULL);
+
+    int a = 1, b = 2, c = 3;
+    TEST_ASSERT(fp_queue_push(queue, &a) == 0);
+    TEST_ASSERT(fp_queue_push(queue, &b) == 0);
+
+    errno = 0;
+    TEST_ASSERT(fp_queue_push(queue, &c) == -1);
+    TEST_ASSERT(errno == EAGAIN);
+
+    int *first = (int *)fp_queue_pop(queue);
+    int *second = (int *)fp_queue_pop(queue);
+    TEST_ASSERT(first && *first == 1);
+    TEST_ASSERT(second && *second == 2);
+    fp_queue_destroy(queue);
+    printf("✅ [queue-capacity] Backpressure path reported EAGAIN and preserved data\n");
+}
+
 int main(void) {
     test_queue_mpmc();
-    printf("[tests] queue MPMC passed\n");
+    test_queue_fifo_order();
+    test_queue_capacity_backpressure();
+    printf("[tests] queue suite passed\n");
     return 0;
 }

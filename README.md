@@ -53,10 +53,10 @@ Always execute both tiers before shipping changes:
 
 ```bash
 make test       # lock-free queue stress tests
-make autotest   # boots the server and POSTs tests/assets/test.png via curl
+make autotest   # boots the server and POSTs a generated PNG (fixture kept at tests/assets/test.png for manual use)
 ```
 
-`make autotest` requires `curl` and leaves nothing running—it spawns the server, POSTs a fixture PNG, validates the JSON payload, then cleans up.
+`make autotest` requires `curl` and leaves nothing running—it spawns the server, POSTs a generated fixture PNG (or tests/assets/test.png manually), validates the JSON payload, then cleans up.
 
 ## API
 

@@ -6,6 +6,10 @@
 - Treat a failing build or test as blocking; fix before proceeding.
 - Log the commands you ran and their outcomes in PR discussions when relevant so other agents/operators can audit the run.
 
+## Deployment
+- Site is hosted on Netlify (ferretptimize.netlify.app); pushing to `main` auto-deploys.
+- Use `make deploy` for a manual Netlify production deploy or `make deploy-temp` for a draft preview when needed.
+
 ## Test Inventory
 | Command       | Description |
 |---------------|-------------|

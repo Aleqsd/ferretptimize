@@ -200,10 +200,49 @@ static void test_queue_capacity_backpressure(void) {
     printf("✅ [queue-capacity] Backpressure path reported EAGAIN and preserved data\n");
 }
 
+static void test_queue_wraparound_ordering(void) {
+    printf("\n🧪 [queue-wrap] Verifying ring buffer wrap-around preserves order\n");
+    fp_queue *queue = fp_queue_create(3);
+    TEST_ASSERT(queue != NULL);
+
+    int values[6] = {0, 1, 2, 3, 4, 5};
+
+    // Fill to capacity and drain partially to force head/tail wrap.
+    TEST_ASSERT(fp_queue_push(queue, &values[0]) == 0);
+    TEST_ASSERT(fp_queue_push(queue, &values[1]) == 0);
+    TEST_ASSERT(fp_queue_push(queue, &values[2]) == 0);
+    int *v0 = (int *)fp_queue_pop(queue);
+    int *v1 = (int *)fp_queue_pop(queue);
+    TEST_ASSERT(v0 && *v0 == 0);
+    TEST_ASSERT(v1 && *v1 == 1);
+
+    // Push more to wrap-around internally.
+    TEST_ASSERT(fp_queue_push(queue, &values[3]) == 0);
+    TEST_ASSERT(fp_queue_push(queue, &values[4]) == 0);
+
+    // Queue should now hold values[2], values[3], values[4] in order.
+    int *v2 = (int *)fp_queue_pop(queue);
+    int *v3 = (int *)fp_queue_pop(queue);
+    int *v4 = (int *)fp_queue_pop(queue);
+    TEST_ASSERT(v2 && *v2 == 2);
+    TEST_ASSERT(v3 && *v3 == 3);
+    TEST_ASSERT(v4 && *v4 == 4);
+
+    // Final push/pop after full cycle.
+    TEST_ASSERT(fp_queue_push(queue, &values[5]) == 0);
+    int *v5 = (int *)fp_queue_pop(queue);
+    TEST_ASSERT(v5 && *v5 == 5);
+
+    TEST_ASSERT(fp_queue_pop(queue) == NULL);
+    fp_queue_destroy(queue);
+    printf("✅ [queue-wrap] Wrap-around path preserved FIFO ordering\n");
+}
+
 int main(void) {
     test_queue_mpmc();
     test_queue_fifo_order();
     test_queue_capacity_backpressure();
+    test_queue_wraparound_ordering();
     run_image_ops_tests();
     printf("[tests] queue suite passed\n");
     return 0;

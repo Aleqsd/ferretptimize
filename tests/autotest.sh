@@ -8,6 +8,9 @@ PORT="${FERRET_AUTOTEST_PORT:-9090}"
 HOST="127.0.0.1"
 export HOST PORT TEST_PNG
 
+: "${FP_EXPERT_API_KEY:=autotest-expert-key}"
+export FP_EXPERT_API_KEY
+
 if [[ ! -x "$BIN" ]]; then
   echo "Binary not found: $BIN" >&2
   exit 1
@@ -201,13 +204,30 @@ run_tune("webp", "high", "more", sys.argv[2])
 print("✅ [autotest] All variants validated")
 print("✅ [autotest] Tuning paths validated")
 
-# Expert mode: two files, crop applied via metadata, verify geometry/results
-curl_cmd_expert = [
-    "curl", "--fail", "--silent", "--show-error",
+# Expert mode: enforce auth gate then run authorized request
+EXPERT_URL = f"http://{os.environ['HOST']}:{os.environ['PORT']}/api/expert/compress"
+multipart = [
     "-F", f"files[]=@{os.environ['TEST_PNG']};filename=expert1.png",
     "-F", f"files[]=@{os.environ['TEST_PNG']};filename=expert2.png",
-    "-F", 'metadata={"crop":{"enabled":true,"x":12,"y":12,"width":64,"height":48},"webpQuality":80,"pngLevel":7};type=application/json',
-    f"http://{os.environ['HOST']}:{os.environ['PORT']}/api/expert/compress"
+    "-F", 'metadata={"crop":{"enabled":true,"x":12,"y":12,"width":64,"height":48},"trimEnabled":true,"trimTolerance":0.0,"webpQuality":82,"pngLevel":6,"pngQuantColors":88,"avifQuality":29};type=application/json',
+    "-F", 'metadata0={"crop":{"enabled":true,"x":8,"y":8,"width":40,"height":32},"pngLevel":5,"pngQuantColors":96,"webpQuality":70,"avifQuality":30,"trimEnabled":true,"trimTolerance":0.01};type=application/json',
+    "-F", 'metadata1={"crop":{"enabled":true,"x":16,"y":12,"width":24,"height":20},"pngLevel":7,"pngQuantColors":128,"webpQuality":85,"avifQuality":26,"trimEnabled":true,"trimTolerance":0.02};type=application/json',
+]
+
+unauth = subprocess.run(
+    ["curl", "--silent", "--output", "/dev/null", "--write-out", "%{http_code}", *multipart, EXPERT_URL],
+    check=False,
+    text=True,
+    capture_output=True,
+)
+if unauth.returncode != 0 or unauth.stdout.strip() != "401":
+    raise SystemExit(f"expert autotest: expected 401 without Authorization, got rc={unauth.returncode} body='{unauth.stdout.strip()}' stderr='{unauth.stderr.strip()}'")
+
+curl_cmd_expert = [
+    "curl", "--fail", "--silent", "--show-error",
+    "-H", f"Authorization: ApiKey {os.environ['FP_EXPERT_API_KEY']}",
+    *multipart,
+    EXPERT_URL,
 ]
 with open(os.environ["RESPONSE_EXPERT_JSON"], "w", encoding="utf-8") as outf:
     subprocess.run(curl_cmd_expert, check=True, stdout=outf)
@@ -218,15 +238,41 @@ if expert.get("status") != "ok":
     raise SystemExit(f"expert autotest: server returned error {expert.get('message')}")
 if len(files) != 2:
     raise SystemExit(f"expert autotest: expected 2 file results, got {len(files)}")
+for key in ("bytes_saved", "total_input_bytes", "total_output_bytes", "elapsed_ms"):
+    if key not in expert:
+        raise SystemExit(f"expert autotest: expected aggregate field '{key}' in response")
+expected_opts = [
+    {"crop": {"width": 40, "height": 32}, "png_level": 5, "png_colors": 96, "webp_quality": 70, "avif_quality": 30},
+    {"crop": {"width": 24, "height": 20}, "png_level": 7, "png_colors": 128, "webp_quality": 85, "avif_quality": 26},
+]
 for idx, item in enumerate(files, 1):
     geom = item.get("geometry") or {}
-    if geom.get("outputWidth") != 64 or geom.get("outputHeight") != 48:
-        raise SystemExit(f"expert autotest: file {idx} geometry mismatch {geom}")
+    expected = expected_opts[idx - 1]
+    if geom.get("outputWidth") != expected["crop"]["width"] or geom.get("outputHeight") != expected["crop"]["height"]:
+        raise SystemExit(f"expert autotest: file {idx} geometry mismatch {geom} expected {expected['crop']}")
     if not item.get("cropApplied"):
         raise SystemExit(f"expert autotest: expected cropApplied=true for file {idx}")
+    trim_flag = item.get("trimApplied", item.get("trims_applied"))
+    if trim_flag is None:
+        raise SystemExit(f"expert autotest: expected trim marker on file {idx}")
+    if "bytes_saved" not in item:
+        raise SystemExit(f"expert autotest: expected bytes_saved per file {idx}")
     outputs = item.get("results") or []
     if len(outputs) != 4:
         raise SystemExit(f"expert autotest: expected 4 outputs per file, got {len(outputs)}")
+    for out in outputs:
+        params = out.get("params_used") or {}
+        if not params:
+            raise SystemExit(f"expert autotest: missing params_used for output {out}")
+        fmt = out.get("format")
+        if fmt == "png" and params.get("level") != expected["png_level"]:
+            raise SystemExit(f"expert autotest: expected png level {expected['png_level']} for file {idx}, got {params}")
+        if fmt == "pngquant" and params.get("colors") != expected["png_colors"]:
+            raise SystemExit(f"expert autotest: expected pngquant colors {expected['png_colors']} for file {idx}, got {params}")
+        if fmt == "webp" and params.get("quality") != expected["webp_quality"]:
+            raise SystemExit(f"expert autotest: expected webp quality {expected['webp_quality']} for file {idx}, got {params}")
+        if fmt == "avif" and params.get("quality") != expected["avif_quality"]:
+            raise SystemExit(f"expert autotest: expected avif quality {expected['avif_quality']} for file {idx}, got {params}")
 print_summary("autotest-expert", {"jobId": files[0].get("jobId"), "durationMs": files[0].get("durationMs", 0), "inputBytes": files[0].get("inputBytes", 0), "filename": files[0].get("filename"), "results": files[0].get("results")})
-print("✅ [autotest] Expert multipart path validated")
+print("✅ [autotest] Expert multipart path validated (auth + crop)")
 PY

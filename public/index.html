@@ -3,18 +3,24 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta name="google-client-id" content="YOUR_GOOGLE_CLIENT_ID" />
+  <meta name="google-client-id" content="" />
   <title>Superfast image compressor</title>
   <link rel="stylesheet" href="/style.css" />
+  <script src="/env.js"></script>
   <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 <body>
   <div class="glow"></div>
   <main class="app">
     <div class="login-nav">
-      <div class="login-actions" aria-label="Social login">
-        <div id="google-login" class="pill login google" role="button">Login with Google</div>
-        <button class="pill login facebook" type="button">Login with Facebook</button>
+      <div class="login-menu" aria-label="Login menu">
+        <button id="login-toggle" class="pill login-toggle" type="button" aria-haspopup="true" aria-expanded="false">
+          Login <span aria-hidden="true">▾</span>
+        </button>
+        <div id="login-dropdown" class="login-dropdown hidden" role="menu">
+          <p class="dropdown-label">Connect</p>
+          <div id="google-login" class="google-slot" role="menuitem"></div>
+        </div>
       </div>
     </div>
 
@@ -67,31 +73,53 @@
     </section>
 
     <section class="expert-highlight">
-      <div class="section-header">
-        <h2>✨ Expert Mode</h2>
-        <p class="meta">Advanced tier (API, batch, trim/crop)</p>
+      <div class="expert-cta">
+        <div class="expert-cta-copy">
+          <p class="eyebrow">Expert mode</p>
+          <h2>✨ Pro boost</h2>
+          <p class="meta">API, batching, and cropping for teams that want full control.</p>
+        </div>
+        <div class="expert-cta-actions">
+          <button id="expert-open" type="button" class="ghost-button">Explore the plan</button>
+          <span class="meta">Pricing and details in one click</span>
+        </div>
       </div>
-      <div class="expert-grid">
-        <article class="expert-card subtle">
-          <h3>API + Keys</h3>
-          <p>Server-to-server uploads with JWT/API keys for CI and pipelines.</p>
-        </article>
-        <article class="expert-card subtle">
-          <h3>Tunables</h3>
-          <p>Dial PNG/WebP/AVIF quality, compression levels, and outputs.</p>
-        </article>
-        <article class="expert-card subtle">
-          <h3>Multi-image + Trim/Crop</h3>
-          <p>Batch uploads with whitespace trim and bounding-box crop before encode.</p>
-        </article>
-        <article class="expert-card subtle">
-          <h3>Auth & Billing</h3>
-          <p>Google/Facebook login with Stripe monthly/annual plans.</p>
-        </article>
-        <article class="expert-card subtle">
-          <h3>Roadmap</h3>
-          <p>JPEG/HEIC later; see <a href="/Features.md" target="_blank" rel="noopener">Features.md</a>.</p>
-        </article>
+    </section>
+
+    <section id="expert-modal" class="expert-modal hidden" aria-modal="true" role="dialog" aria-labelledby="expert-modal-title" aria-hidden="true">
+      <div id="expert-modal-backdrop" class="expert-modal-backdrop" role="presentation"></div>
+      <div class="expert-modal-content" role="document">
+        <header class="expert-modal-header">
+          <div>
+            <p class="eyebrow">Expert mode</p>
+            <h3 id="expert-modal-title">The fast lane to configurable optimization</h3>
+            <p class="meta">Secure API, fine-grained controls, multi-image batch, and support for your pipelines.</p>
+          </div>
+          <button id="expert-close" type="button" class="pill close-button" aria-label="Close Expert mode description">✕</button>
+        </header>
+        <div class="expert-modal-grid">
+          <article class="expert-card">
+            <h3>API access & keys</h3>
+            <p>Server-to-server via API key or Google login—ideal for CI/CD and automation.</p>
+          </article>
+          <article class="expert-card">
+            <h3>Advanced controls</h3>
+            <p>PNG/WebP/AVIF quality, compression levels, multiple outputs, pixel-accurate trim + crop.</p>
+          </article>
+          <article class="expert-card">
+            <h3>Clear pricing</h3>
+            <ul class="expert-list">
+              <li><strong>$2/month</strong> · monthly subscription, cancel anytime.</li>
+              <li><strong>$20/year</strong> · annual (2 months free).</li>
+            </ul>
+            <p class="meta">Stripe Checkout, simple billing, no hidden fees.</p>
+          </article>
+          <article class="expert-card">
+            <h3>Team & roadmap</h3>
+            <p>JPEG/HEIC coming soon · priority support for your frontend/CDN integrations.</p>
+            <a href="/Features.md" target="_blank" rel="noopener" class="expert-link">View Features.md</a>
+          </article>
+        </div>
       </div>
     </section>
   </main>

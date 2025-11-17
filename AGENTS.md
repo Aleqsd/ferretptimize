@@ -5,6 +5,7 @@
 - Execute **both** automation tiers (`make test` and `make autotest`) on every run; the latter boots the server and verifies a full PNG upload/response cycle.
 - Treat a failing build or test as blocking; fix before proceeding.
 - Log the commands you ran and their outcomes in PR discussions when relevant so other agents/operators can audit the run.
+- Never commit local auth DB artifacts (`expert_auth.db*`); they’re ignored and should stay local-only.
 
 ## Deployment
 - Site is hosted on Netlify (ferretptimize.netlify.app); pushing to `main` auto-deploys.

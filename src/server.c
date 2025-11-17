@@ -33,9 +33,28 @@
 #define FP_EXPERT_MAX_FILES 10
 #define FP_EXPERT_MAX_FILE (20 * 1024 * 1024)
 #define FP_EXPERT_MAX_TOTAL (100 * 1024 * 1024)
+#define FP_EXPERT_MAX_DAILY_JOBS 500
+#define FP_EXPERT_MAX_DAILY_BYTES (2ULL * 1024ULL * 1024ULL * 1024ULL)
+#define FP_PRICE_MONTHLY_DEFAULT "price_expert_monthly"
+#define FP_PRICE_ANNUAL_DEFAULT "price_expert_annual"
+#define FP_PERIOD_MONTH_SECONDS (30 * 24 * 60 * 60)
+#define FP_PERIOD_ANNUAL_SECONDS (365 * 24 * 60 * 60)
 
 static const char *FP_PUBLIC_ROOT = "public";
 static _Atomic uint64_t g_job_counter = 1;
+static _Atomic uint64_t g_expert_request_count = 0;
+static _Atomic uint64_t g_expert_request_files = 0;
+static _Atomic uint64_t g_expert_request_bytes = 0;
+
+typedef struct {
+    uint64_t user_id;
+    int day;
+    uint64_t jobs;
+    uint64_t bytes;
+} fp_expert_usage_entry;
+
+static fp_expert_usage_entry g_expert_usage[64];
+static pthread_mutex_t g_expert_usage_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static bool fp_is_known_target(const char *format, const char *label) {
     if (!format || !*format) {
@@ -76,6 +95,8 @@ typedef struct {
     char path[256];
     char content_type[128];
     char filename[FP_FILENAME_MAX];
+    char authorization[256];
+    char cookies[512];
     char tune_format[8];
     char tune_label[32];
     int tune_direction;
@@ -419,6 +440,71 @@ static int fp_json_parse_bool(const char *json, const char *key, int *out) {
     return -1;
 }
 
+static void fp_load_price_ids(char *monthly, size_t monthly_len, char *annual, size_t annual_len) {
+    const char *monthly_env = getenv("FP_STRIPE_PRICE_MONTHLY");
+    const char *annual_env = getenv("FP_STRIPE_PRICE_ANNUAL");
+    if (monthly && monthly_len > 0) {
+        snprintf(monthly, monthly_len, "%s", (monthly_env && *monthly_env) ? monthly_env : FP_PRICE_MONTHLY_DEFAULT);
+    }
+    if (annual && annual_len > 0) {
+        snprintf(annual, annual_len, "%s", (annual_env && *annual_env) ? annual_env : FP_PRICE_ANNUAL_DEFAULT);
+    }
+}
+
+static const char *fp_pick_price_id(const char *requested, const char *monthly, const char *annual, char *interval, size_t interval_len) {
+    const char *price_id = monthly;
+    if (interval && interval_len > 0) {
+        snprintf(interval, interval_len, "monthly");
+    }
+    if (requested && *requested) {
+        if (strcasecmp(requested, "annual") == 0 || strcasecmp(requested, "yearly") == 0) {
+            price_id = annual;
+            if (interval && interval_len > 0) {
+                snprintf(interval, interval_len, "annual");
+            }
+        } else if (strcasecmp(requested, "monthly") == 0) {
+            price_id = monthly;
+            if (interval && interval_len > 0) {
+                snprintf(interval, interval_len, "monthly");
+            }
+        } else if (strcasecmp(requested, annual) == 0) {
+            price_id = annual;
+            if (interval && interval_len > 0) {
+                snprintf(interval, interval_len, "annual");
+            }
+        } else if (strcasecmp(requested, monthly) == 0) {
+            price_id = monthly;
+            if (interval && interval_len > 0) {
+                snprintf(interval, interval_len, "monthly");
+            }
+        } else {
+            price_id = requested;
+            if (interval && interval_len > 0) {
+                snprintf(interval, interval_len, "custom");
+            }
+        }
+    }
+    return price_id;
+}
+
+static void fp_generate_stub_id(const char *prefix, char *out, size_t out_len) {
+    if (!out || out_len == 0) {
+        return;
+    }
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    unsigned int rnd = (unsigned int)(ts.tv_nsec ^ ts.tv_sec ^ (unsigned int)getpid());
+    snprintf(out, out_len, "%s%08x%08x", prefix ? prefix : "", rnd, (unsigned int)(rand() & 0xffffffff));
+}
+
+static time_t fp_period_for_price(const char *price_id, const char *monthly, const char *annual) {
+    (void)monthly;
+    if (price_id && annual && strcasecmp(price_id, annual) == 0) {
+        return FP_PERIOD_ANNUAL_SECONDS;
+    }
+    return FP_PERIOD_MONTH_SECONDS;
+}
+
 static void fp_set_default_expert_options(fp_expert_options *opts) {
     if (!opts) {
         return;
@@ -431,11 +517,26 @@ static void fp_set_default_expert_options(fp_expert_options *opts) {
     opts->trim_tolerance = 0.01f;
 }
 
+static void fp_copy_expert_options(fp_expert_options *dst, const fp_expert_options *src) {
+    if (!dst || !src) {
+        return;
+    }
+    memcpy(dst, src, sizeof(*dst));
+}
+
+static double fp_elapsed_ms(const struct timespec *start, const struct timespec *end) {
+    if (!start || !end) {
+        return 0.0;
+    }
+    double start_ms = (double)start->tv_sec * 1000.0 + (double)start->tv_nsec / 1e6;
+    double end_ms = (double)end->tv_sec * 1000.0 + (double)end->tv_nsec / 1e6;
+    return end_ms - start_ms;
+}
+
 static int fp_parse_expert_metadata(const uint8_t *data, size_t len, fp_expert_options *opts) {
     if (!opts) {
         return -1;
     }
-    fp_set_default_expert_options(opts);
     if (!data || len == 0) {
         return 0;
     }
@@ -513,6 +614,80 @@ static int fp_parse_expert_metadata(const uint8_t *data, size_t len, fp_expert_o
 
     free(json);
     return 0;
+}
+
+static int fp_metadata_index_from_part_name(const char *name) {
+    if (!name) {
+        return -1;
+    }
+    if (strncasecmp(name, "metadata", 8) != 0) {
+        return -1;
+    }
+    const char *cursor = name + 8;
+    while (*cursor && (*cursor == '[' || *cursor == ']' || *cursor == '_' || *cursor == '-')) {
+        ++cursor;
+    }
+    if (!*cursor) {
+        return -1;
+    }
+    char *endptr = NULL;
+    long idx = strtol(cursor, &endptr, 10);
+    if (endptr == cursor || idx < 0 || idx > FP_EXPERT_MAX_FILES) {
+        return -1;
+    }
+    return (int)idx;
+}
+
+static int fp_current_day_key(void) {
+    time_t now = time(NULL);
+    return (int)(now / 86400);
+}
+
+static int fp_track_expert_usage(uint64_t user_id, size_t file_count, size_t total_bytes, char *err, size_t err_len) {
+    if (user_id == 0) {
+        return 0; // allow unaffiliated keys (dev env)
+    }
+    int today = fp_current_day_key();
+    int rc = 0;
+    pthread_mutex_lock(&g_expert_usage_mutex);
+    size_t slot = 0;
+    for (; slot < sizeof(g_expert_usage) / sizeof(g_expert_usage[0]); ++slot) {
+        fp_expert_usage_entry *entry = &g_expert_usage[slot];
+        if (entry->user_id == user_id && entry->day == today) {
+            break;
+        }
+        if (entry->user_id == 0 || entry->day != today) {
+            entry->user_id = user_id;
+            entry->day = today;
+            entry->jobs = 0;
+            entry->bytes = 0;
+            break;
+        }
+    }
+    if (slot == sizeof(g_expert_usage) / sizeof(g_expert_usage[0])) {
+        rc = -1;
+        if (err && err_len) {
+            snprintf(err, err_len, "Server busy");
+        }
+    } else {
+        fp_expert_usage_entry *entry = &g_expert_usage[slot];
+        if (entry->jobs + file_count > FP_EXPERT_MAX_DAILY_JOBS) {
+            rc = -1;
+            if (err && err_len) {
+                snprintf(err, err_len, "Daily job limit reached");
+            }
+        } else if (entry->bytes + total_bytes > FP_EXPERT_MAX_DAILY_BYTES) {
+            rc = -1;
+            if (err && err_len) {
+                snprintf(err, err_len, "Daily byte limit reached");
+            }
+        } else {
+            entry->jobs += file_count;
+            entry->bytes += total_bytes;
+        }
+    }
+    pthread_mutex_unlock(&g_expert_usage_mutex);
+    return rc;
 }
 
 static const uint8_t *fp_memsearch(const uint8_t *haystack, size_t haystack_len, const uint8_t *needle, size_t needle_len) {
@@ -716,6 +891,10 @@ static int fp_parse_request(char *header_block, fp_http_request *request) {
             strncpy(request->content_type, value, sizeof(request->content_type) - 1);
         } else if (strcmp(name, "x-filename") == 0) {
             strncpy(request->filename, value, sizeof(request->filename) - 1);
+        } else if (strcmp(name, "authorization") == 0) {
+            strncpy(request->authorization, value, sizeof(request->authorization) - 1);
+        } else if (strcmp(name, "cookie") == 0) {
+            strncpy(request->cookies, value, sizeof(request->cookies) - 1);
         } else if (strcmp(name, "x-job-id") == 0) {
             request->client_job_id = strtoull(value, NULL, 10);
         } else if (strcmp(name, "x-tune-format") == 0) {
@@ -731,6 +910,219 @@ static int fp_parse_request(char *header_block, fp_http_request *request) {
         }
     }
     return 0;
+}
+
+static void fp_trim_token(char *value) {
+    if (!value) {
+        return;
+    }
+    char *start = value;
+    while (*start && isspace((unsigned char)*start)) {
+        ++start;
+    }
+    char *end = start + strlen(start);
+    while (end > start && isspace((unsigned char)end[-1])) {
+        *--end = '\0';
+    }
+    if (start != value) {
+        memmove(value, start, (size_t)(end - start + 1));
+    }
+}
+
+static void fp_get_cookie_value(const fp_http_request *request, const char *name, char *out, size_t out_len) {
+    if (!out || out_len == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (!request || !name || !*name) {
+        return;
+    }
+    const char *cookie_header = request->cookies;
+    if (!cookie_header || !*cookie_header) {
+        return;
+    }
+    size_t name_len = strlen(name);
+    const char *cursor = cookie_header;
+    while (*cursor) {
+        while (*cursor == ' ' || *cursor == '\t' || *cursor == ';') {
+            ++cursor;
+        }
+        if (strncmp(cursor, name, name_len) == 0 && cursor[name_len] == '=') {
+            cursor += name_len + 1;
+            size_t idx = 0;
+            while (*cursor && *cursor != ';' && idx + 1 < out_len) {
+                out[idx++] = *cursor++;
+            }
+            out[idx] = '\0';
+            fp_trim_token(out);
+            return;
+        }
+        while (*cursor && *cursor != ';') {
+            ++cursor;
+        }
+        if (*cursor == ';') {
+            ++cursor;
+        }
+    }
+}
+
+static void fp_extract_auth_token(const char *auth_header, char *out, size_t out_len) {
+    if (!out || out_len == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (!auth_header) {
+        return;
+    }
+    while (*auth_header && isspace((unsigned char)*auth_header)) {
+        ++auth_header;
+    }
+    if (strncasecmp(auth_header, "bearer ", 7) == 0) {
+        auth_header += 7;
+    } else if (strncasecmp(auth_header, "apikey ", 7) == 0) {
+        auth_header += 7;
+    }
+    while (*auth_header && isspace((unsigned char)*auth_header)) {
+        ++auth_header;
+    }
+    size_t copy_len = strnlen(auth_header, out_len - 1);
+    memcpy(out, auth_header, copy_len);
+    out[copy_len] = '\0';
+    fp_trim_token(out);
+}
+
+static bool fp_match_api_key(const char *token, const char *csv) {
+    if (!token || !*token || !csv || !*csv) {
+        return false;
+    }
+    const char *cursor = csv;
+    while (*cursor) {
+        while (*cursor == ',' || isspace((unsigned char)*cursor)) {
+            ++cursor;
+        }
+        if (!*cursor) {
+            break;
+        }
+        const char *start = cursor;
+        while (*cursor && *cursor != ',') {
+            ++cursor;
+        }
+        size_t len = (size_t)(cursor - start);
+        while (len > 0 && isspace((unsigned char)start[len - 1])) {
+            --len;
+        }
+        if (len > 0 && len < 256) {
+            char candidate[256];
+            memcpy(candidate, start, len);
+            candidate[len] = '\0';
+            fp_trim_token(candidate);
+            if (candidate[0] != '\0' && strcmp(candidate, token) == 0) {
+                return true;
+            }
+        }
+        if (*cursor == ',') {
+            ++cursor;
+        }
+    }
+    return false;
+}
+
+static int fp_authenticate_request(fp_auth_store *auth_store, const fp_http_request *request, fp_auth_user *out_user);
+
+static bool fp_is_expert_authorized(const fp_http_request *request,
+                                    fp_auth_store *auth_store,
+                                    fp_auth_user *out_user,
+                                    char *auth_source,
+                                    size_t auth_source_len,
+                                    char *deny_reason,
+                                    size_t deny_reason_len) {
+    const char *keys_csv = getenv("FP_EXPERT_API_KEYS");
+    const char *single_key = getenv("FP_EXPERT_API_KEY");
+    if (auth_source && auth_source_len) {
+        auth_source[0] = '\0';
+    }
+    if (deny_reason && deny_reason_len) {
+        deny_reason[0] = '\0';
+    }
+    if (out_user) {
+        memset(out_user, 0, sizeof(*out_user));
+    }
+    char token[256];
+    fp_extract_auth_token(request ? request->authorization : NULL, token, sizeof(token));
+    bool env_guard = (keys_csv && *keys_csv) || (single_key && *single_key);
+    if (!env_guard && token[0] == '\0') {
+        if (auth_source && auth_source_len) {
+            snprintf(auth_source, auth_source_len, "dev");
+        }
+        return true; // dev mode: allow requests without keys
+    }
+    if (token[0] != '\0') {
+        if (fp_match_api_key(token, keys_csv) || fp_match_api_key(token, single_key)) {
+            if (auth_source && auth_source_len) {
+                snprintf(auth_source, auth_source_len, "env_api_key");
+            }
+            return true;
+        }
+        if (auth_store) {
+            fp_auth_user key_user = {0};
+            if (fp_auth_api_key_allowed(auth_store, token, "expert", &key_user)) {
+                if (fp_auth_has_active_subscription(auth_store, key_user.id)) {
+                    if (out_user) {
+                        *out_user = key_user;
+                    }
+                    if (auth_source && auth_source_len) {
+                        snprintf(auth_source, auth_source_len, "api_key");
+                    }
+                    return true;
+                }
+                fp_log_warn("🔒 API key rejected: subscription inactive for user %llu", (unsigned long long)key_user.id);
+                if (deny_reason && deny_reason_len) {
+                    snprintf(deny_reason, deny_reason_len, "Subscription inactive");
+                }
+                return false;
+            }
+        }
+    }
+    if (auth_store) {
+        fp_auth_user bearer = {0};
+        if (fp_authenticate_request(auth_store, request, &bearer) == 1) {
+            if (fp_auth_has_active_subscription(auth_store, bearer.id)) {
+                if (out_user) {
+                    *out_user = bearer;
+                }
+                if (auth_source && auth_source_len) {
+                    snprintf(auth_source, auth_source_len, "jwt");
+                }
+                return true;
+            }
+            if (deny_reason && deny_reason_len) {
+                snprintf(deny_reason, deny_reason_len, "Subscription inactive");
+            }
+            return false;
+        }
+    }
+    if (deny_reason && deny_reason_len) {
+        snprintf(deny_reason, deny_reason_len, "Expert mode requires Authorization: ApiKey <token>");
+    }
+    return false;
+}
+
+static int fp_authenticate_request(fp_auth_store *auth_store, const fp_http_request *request, fp_auth_user *out_user) {
+    if (!auth_store || !request) {
+        return -1;
+    }
+    char token[512];
+    fp_extract_auth_token(request->authorization, token, sizeof(token));
+    if (token[0] == '\0') {
+        fp_get_cookie_value(request, "fp_access", token, sizeof(token));
+    }
+    if (token[0] == '\0') {
+        return 0;
+    }
+    if (fp_auth_validate_access(auth_store, token, out_user) != 0) {
+        return -1;
+    }
+    return 1;
 }
 
 static bool fp_parse_stream_path(const char *path, uint64_t *job_id_out) {
@@ -792,33 +1184,49 @@ static int fp_send_buffer(int fd, const void *data, size_t len) {
     return 0;
 }
 
-static int fp_send_http(int fd, int status, const char *status_text, const char *content_type, const void *body, size_t body_len) {
+static int fp_send_http_with_headers(int fd, int status, const char *status_text, const char *content_type,
+                                     const char *extra_headers, const void *body, size_t body_len) {
     if (!status_text) {
         status_text = "OK";
     }
     if (!content_type) {
         content_type = "text/plain; charset=utf-8";
     }
-    char header[512];
-    int header_len = snprintf(header,
-                              sizeof(header),
-                              "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
-                              status,
-                              status_text,
-                              content_type,
-                              body_len);
-    if (header_len < 0 || (size_t)header_len >= sizeof(header)) {
+    fp_buffer header = {0};
+    if (fp_buffer_appendf(&header,
+                          "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nAccess-Control-Allow-Origin: *\r\n",
+                          status,
+                          status_text,
+                          content_type,
+                          body_len) != 0) {
+        fp_buffer_free(&header);
         return -1;
     }
-    if (fp_send_buffer(fd, header, (size_t)header_len) != 0) {
+    if (extra_headers && *extra_headers) {
+        if (fp_buffer_append(&header, extra_headers, strlen(extra_headers)) != 0) {
+            fp_buffer_free(&header);
+            return -1;
+        }
+    }
+    if (FP_APPEND_LITERAL(&header, "Connection: close\r\n\r\n") != 0) {
+        fp_buffer_free(&header);
         return -1;
     }
+    if (fp_send_buffer(fd, header.data, header.size) != 0) {
+        fp_buffer_free(&header);
+        return -1;
+    }
+    fp_buffer_free(&header);
     if (body && body_len > 0) {
         if (fp_send_buffer(fd, body, body_len) != 0) {
             return -1;
         }
     }
     return 0;
+}
+
+static int fp_send_http(int fd, int status, const char *status_text, const char *content_type, const void *body, size_t body_len) {
+    return fp_send_http_with_headers(fd, status, status_text, content_type, NULL, body, body_len);
 }
 
 static int fp_send_text(int fd, int status, const char *status_text, const char *message) {
@@ -888,6 +1296,23 @@ static int fp_send_static_file(int fd, const char *request_path) {
     close(file_fd);
     int rc = fp_send_http(fd, 200, "OK", fp_guess_mime(fs_path), buffer, size);
     free(buffer);
+    return rc;
+}
+
+static int fp_send_env_js(int fd) {
+    const char *client_id = getenv("FP_GOOGLE_CLIENT_ID");
+    if (!client_id) {
+        client_id = "";
+    }
+    fp_buffer resp = {0};
+    if (FP_APPEND_LITERAL(&resp, "window.FP_GOOGLE_CLIENT_ID=") != 0 ||
+        fp_buffer_append_json_string(&resp, client_id) != 0 ||
+        FP_APPEND_LITERAL(&resp, ";\n") != 0) {
+        fp_buffer_free(&resp);
+        return fp_send_text(fd, 500, "Error", "Failed to build env payload");
+    }
+    int rc = fp_send_http(fd, 200, "OK", "application/javascript; charset=utf-8", resp.data, resp.size);
+    fp_buffer_free(&resp);
     return rc;
 }
 
@@ -981,6 +1406,29 @@ static int fp_send_json_error(int fd, int status, const char *message) {
     return rc;
 }
 
+static int fp_send_json_with_cookies(int fd, int status, const char *status_text, const char *json_body,
+                                     const char **cookies, size_t cookie_count) {
+    const char *body = json_body ? json_body : "{}";
+    fp_buffer header_lines = {0};
+    for (size_t i = 0; i < cookie_count; ++i) {
+        if (cookies[i] && cookies[i][0]) {
+            if (fp_buffer_appendf(&header_lines, "Set-Cookie: %s\r\n", cookies[i]) != 0) {
+                fp_buffer_free(&header_lines);
+                return -1;
+            }
+        }
+    }
+    int rc = fp_send_http_with_headers(fd,
+                                       status,
+                                       status_text ? status_text : "OK",
+                                       "application/json",
+                                       header_lines.data ? header_lines.data : "",
+                                       body,
+                                       strlen(body));
+    fp_buffer_free(&header_lines);
+    return rc;
+}
+
 static int fp_send_result_payload(int fd, const fp_result *result, const char *filename) {
     fp_buffer body = {0};
     if (FP_APPEND_LITERAL(&body, "{\"status\":\"ok\",\"jobId\":") != 0 ||
@@ -1045,7 +1493,74 @@ static int fp_send_result_payload(int fd, const fp_result *result, const char *f
     return rc;
 }
 
-static int fp_send_expert_payload(int fd, fp_result **results, char filenames[][FP_FILENAME_MAX], size_t file_count) {
+static int fp_append_params_used(fp_buffer *body, const fp_expert_options *opts, const fp_encoded_image *output) {
+    if (!body) {
+        return -1;
+    }
+    if (FP_APPEND_LITERAL(body, "\"params_used\":{") != 0) {
+        return -1;
+    }
+    int wrote = 0;
+    if (opts && output && output->format[0] != '\0') {
+        if (strcasecmp(output->format, "png") == 0) {
+            if (fp_buffer_appendf(body, "\"level\":%d", opts->png_level) != 0) {
+                return -1;
+            }
+            wrote = 1;
+        } else if (strcasecmp(output->format, "pngquant") == 0) {
+            if (fp_buffer_appendf(body, "\"colors\":%d", opts->png_quant_colors) != 0) {
+                return -1;
+            }
+            wrote = 1;
+        } else if (strcasecmp(output->format, "webp") == 0) {
+            if (fp_buffer_appendf(body, "\"quality\":%d", opts->webp_quality) != 0) {
+                return -1;
+            }
+            wrote = 1;
+        } else if (strcasecmp(output->format, "avif") == 0) {
+            if (fp_buffer_appendf(body, "\"quality\":%d", opts->avif_quality) != 0) {
+                return -1;
+            }
+            wrote = 1;
+        }
+    }
+    if (opts && opts->trim_enabled) {
+        if (wrote && fp_buffer_append(body, ",", 1) != 0) {
+            return -1;
+        }
+        if (fp_buffer_appendf(body, "\"trimTolerance\":%.3f", opts->trim_tolerance) != 0) {
+            return -1;
+        }
+        wrote = 1;
+    }
+    if (opts && opts->crop.enabled) {
+        if (wrote && fp_buffer_append(body, ",", 1) != 0) {
+            return -1;
+        }
+        if (fp_buffer_appendf(body,
+                              "\"crop\":{\"x\":%d,\"y\":%d,\"width\":%d,\"height\":%d}",
+                              opts->crop.x,
+                              opts->crop.y,
+                              opts->crop.width,
+                              opts->crop.height) != 0) {
+            return -1;
+        }
+        wrote = 1;
+    }
+    if (!wrote) {
+        if (FP_APPEND_LITERAL(body, "\"default\":true") != 0) {
+            return -1;
+        }
+    }
+    return FP_APPEND_LITERAL(body, "}") == 0 ? 0 : -1;
+}
+
+static int fp_send_expert_payload(int fd,
+                                  fp_result **results,
+                                  char filenames[][FP_FILENAME_MAX],
+                                  const fp_expert_options *opts,
+                                  size_t file_count,
+                                  double request_elapsed_ms) {
     if (!results || file_count == 0) {
         return fp_send_json_error(fd, 400, "No files processed");
     }
@@ -1054,6 +1569,8 @@ static int fp_send_expert_payload(int fd, fp_result **results, char filenames[][
         fp_buffer_free(&body);
         return fp_send_json_error(fd, 500, "Failed to build payload");
     }
+    size_t total_input = 0;
+    size_t total_output = 0;
     for (size_t i = 0; i < file_count; ++i) {
         fp_result *res = results[i];
         if (!res) {
@@ -1066,6 +1583,8 @@ static int fp_send_expert_payload(int fd, fp_result **results, char filenames[][
             }
         }
         double duration = fp_duration_ms(res);
+        size_t best_output = res->input_size;
+        total_input += res->input_size;
         if (FP_APPEND_LITERAL(&body, "{\"jobId\":") != 0 ||
             fp_buffer_appendf(&body, "%llu", (unsigned long long)res->id) != 0 ||
             FP_APPEND_LITERAL(&body, ",\"filename\":") != 0 ||
@@ -1088,7 +1607,15 @@ static int fp_send_expert_payload(int fd, fp_result **results, char filenames[][
             fp_buffer_append(&body,
                              res->trim_applied ? "true" : "false",
                              res->trim_applied ? 4 : 5) != 0 ||
+            FP_APPEND_LITERAL(&body, ",\"trims_applied\":") != 0 ||
+            fp_buffer_append(&body,
+                             res->trim_applied ? "true" : "false",
+                             res->trim_applied ? 4 : 5) != 0 ||
             FP_APPEND_LITERAL(&body, ",\"cropApplied\":") != 0 ||
+            fp_buffer_append(&body,
+                             res->crop_applied ? "true" : "false",
+                             res->crop_applied ? 4 : 5) != 0 ||
+            FP_APPEND_LITERAL(&body, ",\"crops_applied\":") != 0 ||
             fp_buffer_append(&body,
                              res->crop_applied ? "true" : "false",
                              res->crop_applied ? 4 : 5) != 0 ||
@@ -1107,6 +1634,9 @@ static int fp_send_expert_payload(int fd, fp_result **results, char filenames[][
             fp_encoded_image output = res->outputs[j];
             const uint8_t *raw = output.data ? output.data : (const uint8_t *)"";
             size_t raw_size = output.data ? output.size : 0;
+            if (output.size < best_output) {
+                best_output = output.size;
+            }
             char *encoded = fp_base64_encode(raw, raw_size);
             if (!encoded) {
                 fp_buffer_free(&body);
@@ -1116,7 +1646,7 @@ static int fp_send_expert_payload(int fd, fp_result **results, char filenames[][
                 fp_buffer_append_json_string(&body, output.format) != 0 ||
                 FP_APPEND_LITERAL(&body, ",\"label\":") != 0 ||
                 fp_buffer_append_json_string(&body, output.label) != 0 ||
-                FP_APPEND_LITERAL(&body, ",\"bytes\":") != 0 ||
+                FP_APPEND_LITERAL(&body, ",\"size_bytes\":") != 0 ||
                 fp_buffer_appendf(&body, "%zu", output.size) != 0 ||
                 FP_APPEND_LITERAL(&body, ",\"mime\":") != 0 ||
                 fp_buffer_append_json_string(&body, output.mime) != 0 ||
@@ -1126,6 +1656,8 @@ static int fp_send_expert_payload(int fd, fp_result **results, char filenames[][
                 fp_buffer_append_json_string(&body, output.tuning) != 0 ||
                 FP_APPEND_LITERAL(&body, ",\"data\":") != 0 ||
                 fp_buffer_append_json_string(&body, encoded) != 0 ||
+                FP_APPEND_LITERAL(&body, ",") != 0 ||
+                fp_append_params_used(&body, opts ? &opts[i] : NULL, &output) != 0 ||
                 FP_APPEND_LITERAL(&body, "}") != 0) {
                 free(encoded);
                 fp_buffer_free(&body);
@@ -1134,13 +1666,26 @@ static int fp_send_expert_payload(int fd, fp_result **results, char filenames[][
             free(encoded);
         }
 
-        if (FP_APPEND_LITERAL(&body, "]}") != 0) {
+        size_t saved = res->input_size > best_output ? res->input_size - best_output : 0;
+        total_output += best_output;
+        if (FP_APPEND_LITERAL(&body, "],\"bytes_saved\":") != 0 ||
+            fp_buffer_appendf(&body, "%zu", saved) != 0 ||
+            FP_APPEND_LITERAL(&body, "}") != 0) {
             fp_buffer_free(&body);
             return fp_send_json_error(fd, 500, "Failed to build payload");
         }
     }
 
-    if (FP_APPEND_LITERAL(&body, "]}") != 0) {
+    size_t aggregate_saved = total_input > total_output ? total_input - total_output : 0;
+    if (FP_APPEND_LITERAL(&body, "],\"bytes_saved\":") != 0 ||
+        fp_buffer_appendf(&body, "%zu", aggregate_saved) != 0 ||
+        FP_APPEND_LITERAL(&body, ",\"total_input_bytes\":") != 0 ||
+        fp_buffer_appendf(&body, "%zu", total_input) != 0 ||
+        FP_APPEND_LITERAL(&body, ",\"total_output_bytes\":") != 0 ||
+        fp_buffer_appendf(&body, "%zu", total_output) != 0 ||
+        FP_APPEND_LITERAL(&body, ",\"elapsed_ms\":") != 0 ||
+        fp_buffer_appendf(&body, "%.3f", request_elapsed_ms) != 0 ||
+        FP_APPEND_LITERAL(&body, "}") != 0) {
         fp_buffer_free(&body);
         return fp_send_json_error(fd, 500, "Failed to build payload");
     }
@@ -1424,7 +1969,12 @@ static fp_result *fp_submit_job(fp_job *job,
     return result;
 }
 
-static int fp_handle_google_auth(int fd, const uint8_t *body, size_t body_len) {
+static int fp_handle_google_auth(int fd, const fp_http_request *request, const uint8_t *body, size_t body_len,
+                                 fp_auth_store *auth_store) {
+    (void)request;
+    if (!auth_store) {
+        return fp_send_json_error(fd, 500, "Auth storage unavailable");
+    }
     if (!body || body_len == 0) {
         return fp_send_json_error(fd, 400, "Missing body");
     }
@@ -1444,20 +1994,15 @@ static int fp_handle_google_auth(int fd, const uint8_t *body, size_t body_len) {
         return fp_send_json_error(fd, 500, "Server missing FP_GOOGLE_CLIENT_ID");
     }
 
-    // JWT format: header.payload.signature
     char *token = credential;
     char *dot1 = strchr(token, '.');
-    if (!dot1) {
+    char *dot2 = dot1 ? strchr(dot1 + 1, '.') : NULL;
+    if (!dot1 || !dot2) {
         free(json);
         return fp_send_json_error(fd, 400, "Invalid token");
     }
-    char *dot2 = strchr(dot1 + 1, '.');
-    if (!dot2) {
-        free(json);
-        return fp_send_json_error(fd, 400, "Invalid token");
-    }
-    *dot1 = '\0';
     *dot2 = '\0';
+    *dot1 = '\0';
     uint8_t *payload = NULL;
     size_t payload_len = 0;
     if (fp_base64url_decode(dot1 + 1, &payload, &payload_len) != 0 || !payload) {
@@ -1483,21 +2028,66 @@ static int fp_handle_google_auth(int fd, const uint8_t *body, size_t body_len) {
         return fp_send_json_error(fd, 401, "Invalid audience");
     }
 
+    char issuer[256] = {0};
+    fp_extract_json_string(payload_json, "iss", issuer, sizeof(issuer));
+    if (issuer[0] != '\0' &&
+        strncasecmp(issuer, "https://accounts.google.com", 28) != 0 &&
+        strncasecmp(issuer, "accounts.google.com", 20) != 0) {
+        free(payload_json);
+        free(json);
+        return fp_send_json_error(fd, 401, "Invalid issuer");
+    }
+
     char email[256] = {0};
     char name[256] = {0};
     char picture[512] = {0};
+    char sub[128] = {0};
     fp_extract_json_string(payload_json, "email", email, sizeof(email));
     fp_extract_json_string(payload_json, "name", name, sizeof(name));
     fp_extract_json_string(payload_json, "picture", picture, sizeof(picture));
+    fp_extract_json_string(payload_json, "sub", sub, sizeof(sub));
+    if (sub[0] == '\0') {
+        free(payload_json);
+        free(json);
+        return fp_send_json_error(fd, 400, "Token missing subject");
+    }
+
+    fp_auth_user user = {0};
+    if (fp_auth_upsert_user(auth_store, "google", sub, email, name, picture, payload_json, &user) != 0) {
+        free(payload_json);
+        free(json);
+        return fp_send_json_error(fd, 500, "Unable to persist user");
+    }
+
+    fp_auth_tokens tokens = {0};
+    if (fp_auth_issue_tokens(auth_store, &user, &tokens) != 0) {
+        free(payload_json);
+        free(json);
+        return fp_send_json_error(fd, 500, "Unable to issue tokens");
+    }
+
+    fp_auth_record_audit(auth_store, user.id, "login_google", payload_json);
 
     fp_buffer resp = {0};
-    if (FP_APPEND_LITERAL(&resp, "{\"status\":\"ok\",\"message\":\"ok\"") != 0 ||
+    if (FP_APPEND_LITERAL(&resp, "{\"status\":\"ok\",\"user\":{") != 0 ||
+        FP_APPEND_LITERAL(&resp, "\"id\":") != 0 ||
+        fp_buffer_appendf(&resp, "%llu", (unsigned long long)user.id) != 0 ||
         FP_APPEND_LITERAL(&resp, ",\"email\":") != 0 ||
-        fp_buffer_append_json_string(&resp, email) != 0 ||
+        fp_buffer_append_json_string(&resp, user.email) != 0 ||
         FP_APPEND_LITERAL(&resp, ",\"name\":") != 0 ||
-        fp_buffer_append_json_string(&resp, name) != 0 ||
+        fp_buffer_append_json_string(&resp, user.name) != 0 ||
+        FP_APPEND_LITERAL(&resp, ",\"provider\":") != 0 ||
+        fp_buffer_append_json_string(&resp, user.provider) != 0 ||
         FP_APPEND_LITERAL(&resp, ",\"picture\":") != 0 ||
-        fp_buffer_append_json_string(&resp, picture) != 0 ||
+        fp_buffer_append_json_string(&resp, user.picture) != 0 ||
+        FP_APPEND_LITERAL(&resp, "},\"accessToken\":") != 0 ||
+        fp_buffer_append_json_string(&resp, tokens.access_token) != 0 ||
+        FP_APPEND_LITERAL(&resp, ",\"refreshToken\":") != 0 ||
+        fp_buffer_append_json_string(&resp, tokens.refresh_token) != 0 ||
+        FP_APPEND_LITERAL(&resp, ",\"accessExpires\":") != 0 ||
+        fp_buffer_appendf(&resp, "%lld", (long long)tokens.access_expires_at) != 0 ||
+        FP_APPEND_LITERAL(&resp, ",\"refreshExpires\":") != 0 ||
+        fp_buffer_appendf(&resp, "%lld", (long long)tokens.refresh_expires_at) != 0 ||
         FP_APPEND_LITERAL(&resp, "}") != 0) {
         fp_buffer_free(&resp);
         free(payload_json);
@@ -1505,9 +2095,440 @@ static int fp_handle_google_auth(int fd, const uint8_t *body, size_t body_len) {
         return fp_send_json_error(fd, 500, "Internal error");
     }
 
-    int rc = fp_send_http(fd, 200, "OK", "application/json", resp.data, resp.size);
+    char access_cookie[1024];
+    char refresh_cookie[1024];
+    snprintf(access_cookie,
+             sizeof(access_cookie),
+             "fp_access=%s; HttpOnly; Path=/; Max-Age=%d; SameSite=Lax; Secure",
+             tokens.access_token,
+             auth_store->access_ttl_seconds);
+    snprintf(refresh_cookie,
+             sizeof(refresh_cookie),
+             "fp_refresh=%s; HttpOnly; Path=/; Max-Age=%d; SameSite=Lax; Secure",
+             tokens.refresh_token,
+             auth_store->refresh_ttl_seconds);
+    const char *cookies[] = {access_cookie, refresh_cookie};
+
+    int rc = fp_send_json_with_cookies(fd, 200, "OK", resp.data, cookies, sizeof(cookies) / sizeof(cookies[0]));
     fp_buffer_free(&resp);
     free(payload_json);
+    free(json);
+    return rc;
+}
+
+static int fp_handle_facebook_auth(int fd, const fp_http_request *request, const uint8_t *body, size_t body_len,
+                                   fp_auth_store *auth_store) {
+    (void)request;
+    if (!auth_store) {
+        return fp_send_json_error(fd, 500, "Auth storage unavailable");
+    }
+    if (!body || body_len == 0) {
+        return fp_send_json_error(fd, 400, "Missing body");
+    }
+    char *json = strndup((const char *)body, body_len);
+    if (!json) {
+        return fp_send_json_error(fd, 500, "Out of memory");
+    }
+
+    char access_token[4096] = {0};
+    char user_id[256] = {0};
+    char email[256] = {0};
+    char name[256] = {0};
+    char picture[512] = {0};
+    fp_extract_json_string(json, "accessToken", access_token, sizeof(access_token));
+    fp_extract_json_string(json, "userID", user_id, sizeof(user_id));
+    fp_extract_json_string(json, "userId", user_id, sizeof(user_id));
+    fp_extract_json_string(json, "email", email, sizeof(email));
+    fp_extract_json_string(json, "name", name, sizeof(name));
+    fp_extract_json_string(json, "picture", picture, sizeof(picture));
+
+    if (access_token[0] == '\0') {
+        free(json);
+        return fp_send_json_error(fd, 400, "Missing accessToken");
+    }
+    if (user_id[0] == '\0') {
+        free(json);
+        return fp_send_json_error(fd, 400, "Missing userID");
+    }
+    const char *app_id = getenv("FP_FACEBOOK_APP_ID");
+    if (!app_id || strlen(app_id) < 3) {
+        free(json);
+        return fp_send_json_error(fd, 500, "Server missing FP_FACEBOOK_APP_ID");
+    }
+    if (!strstr(access_token, app_id)) {
+        free(json);
+        return fp_send_json_error(fd, 401, "Invalid audience");
+    }
+
+    fp_auth_user user = {0};
+    if (fp_auth_upsert_user(auth_store, "facebook", user_id, email, name, picture, json, &user) != 0) {
+        free(json);
+        return fp_send_json_error(fd, 500, "Unable to persist user");
+    }
+
+    fp_auth_tokens tokens = {0};
+    if (fp_auth_issue_tokens(auth_store, &user, &tokens) != 0) {
+        free(json);
+        return fp_send_json_error(fd, 500, "Unable to issue tokens");
+    }
+
+    fp_auth_record_audit(auth_store, user.id, "login_facebook", json);
+
+    fp_buffer resp = {0};
+    if (FP_APPEND_LITERAL(&resp, "{\"status\":\"ok\",\"user\":{") != 0 ||
+        FP_APPEND_LITERAL(&resp, "\"id\":") != 0 ||
+        fp_buffer_appendf(&resp, "%llu", (unsigned long long)user.id) != 0 ||
+        FP_APPEND_LITERAL(&resp, ",\"email\":") != 0 ||
+        fp_buffer_append_json_string(&resp, user.email) != 0 ||
+        FP_APPEND_LITERAL(&resp, ",\"name\":") != 0 ||
+        fp_buffer_append_json_string(&resp, user.name) != 0 ||
+        FP_APPEND_LITERAL(&resp, ",\"provider\":") != 0 ||
+        fp_buffer_append_json_string(&resp, user.provider) != 0 ||
+        FP_APPEND_LITERAL(&resp, ",\"picture\":") != 0 ||
+        fp_buffer_append_json_string(&resp, user.picture) != 0 ||
+        FP_APPEND_LITERAL(&resp, "},\"accessToken\":") != 0 ||
+        fp_buffer_append_json_string(&resp, tokens.access_token) != 0 ||
+        FP_APPEND_LITERAL(&resp, ",\"refreshToken\":") != 0 ||
+        fp_buffer_append_json_string(&resp, tokens.refresh_token) != 0 ||
+        FP_APPEND_LITERAL(&resp, ",\"accessExpires\":") != 0 ||
+        fp_buffer_appendf(&resp, "%lld", (long long)tokens.access_expires_at) != 0 ||
+        FP_APPEND_LITERAL(&resp, ",\"refreshExpires\":") != 0 ||
+        fp_buffer_appendf(&resp, "%lld", (long long)tokens.refresh_expires_at) != 0 ||
+        FP_APPEND_LITERAL(&resp, "}") != 0) {
+        fp_buffer_free(&resp);
+        free(json);
+        return fp_send_json_error(fd, 500, "Internal error");
+    }
+
+    char access_cookie[1024];
+    char refresh_cookie[1024];
+    snprintf(access_cookie,
+             sizeof(access_cookie),
+             "fp_access=%s; HttpOnly; Path=/; Max-Age=%d; SameSite=Lax; Secure",
+             tokens.access_token,
+             auth_store->access_ttl_seconds);
+    snprintf(refresh_cookie,
+             sizeof(refresh_cookie),
+             "fp_refresh=%s; HttpOnly; Path=/; Max-Age=%d; SameSite=Lax; Secure",
+             tokens.refresh_token,
+             auth_store->refresh_ttl_seconds);
+    const char *cookies[] = {access_cookie, refresh_cookie};
+
+    int rc = fp_send_json_with_cookies(fd, 200, "OK", resp.data, cookies, sizeof(cookies) / sizeof(cookies[0]));
+    fp_buffer_free(&resp);
+    free(json);
+    return rc;
+}
+
+static int fp_handle_api_key_issue(int fd, const fp_http_request *request, const uint8_t *body, size_t body_len,
+                                   fp_auth_store *auth_store) {
+    if (!auth_store) {
+        return fp_send_json_error(fd, 500, "Auth storage unavailable");
+    }
+    fp_auth_user user = {0};
+    int auth_state = fp_authenticate_request(auth_store, request, &user);
+    if (auth_state <= 0) {
+        return fp_send_json_error(fd, 401, "Missing or invalid access token");
+    }
+
+    char scope[64] = "expert";
+    char label[128] = "";
+    char *json_body = NULL;
+    if (body && body_len > 0) {
+        json_body = strndup((const char *)body, body_len);
+        if (!json_body) {
+            return fp_send_json_error(fd, 500, "Out of memory");
+        }
+        char tmp_scope[64] = {0};
+        if (fp_extract_json_string(json_body, "scope", tmp_scope, sizeof(tmp_scope)) > 0) {
+            snprintf(scope, sizeof(scope), "%s", tmp_scope);
+            fp_trim_token(scope);
+            if (scope[0] == '\0') {
+                snprintf(scope, sizeof(scope), "expert");
+            }
+        }
+        fp_extract_json_string(json_body, "label", label, sizeof(label));
+        fp_trim_token(label);
+    }
+
+    char api_key[256];
+    if (fp_auth_generate_api_key(auth_store, user.id, scope, label, api_key, sizeof(api_key)) != 0) {
+        free(json_body);
+        return fp_send_json_error(fd, 500, "Unable to issue API key");
+    }
+
+    fp_buffer resp = {0};
+    if (FP_APPEND_LITERAL(&resp, "{\"status\":\"ok\",\"apiKey\":") != 0 ||
+        fp_buffer_append_json_string(&resp, api_key) != 0 ||
+        FP_APPEND_LITERAL(&resp, ",\"scope\":") != 0 ||
+        fp_buffer_append_json_string(&resp, scope) != 0 ||
+        FP_APPEND_LITERAL(&resp, ",\"userId\":") != 0 ||
+        fp_buffer_appendf(&resp, "%llu", (unsigned long long)user.id) != 0 ||
+        FP_APPEND_LITERAL(&resp, ",\"label\":") != 0 ||
+        fp_buffer_append_json_string(&resp, label) != 0 ||
+        FP_APPEND_LITERAL(&resp, "}") != 0) {
+        fp_buffer_free(&resp);
+        free(json_body);
+        return fp_send_json_error(fd, 500, "Internal error");
+    }
+
+    fp_buffer audit_meta = {0};
+    if (FP_APPEND_LITERAL(&audit_meta, "{\"scope\":") == 0 &&
+        fp_buffer_append_json_string(&audit_meta, scope) == 0 &&
+        FP_APPEND_LITERAL(&audit_meta, ",\"label\":") == 0 &&
+        fp_buffer_append_json_string(&audit_meta, label) == 0 &&
+        FP_APPEND_LITERAL(&audit_meta, "}") == 0) {
+        fp_auth_record_audit(auth_store, user.id, "api_key_issued", audit_meta.data);
+    } else {
+        fp_auth_record_audit(auth_store, user.id, "api_key_issued", NULL);
+    }
+    fp_buffer_free(&audit_meta);
+
+    int rc = fp_send_http(fd, 200, "OK", "application/json", resp.data, resp.size);
+    fp_buffer_free(&resp);
+    free(json_body);
+    return rc;
+}
+
+static int fp_handle_checkout_session(int fd, const fp_http_request *request, const uint8_t *body, size_t body_len,
+                                      fp_auth_store *auth_store) {
+    if (!auth_store) {
+        return fp_send_json_error(fd, 500, "Billing unavailable");
+    }
+    fp_auth_user user = {0};
+    int auth_state = fp_authenticate_request(auth_store, request, &user);
+    if (auth_state != 1) {
+        return fp_send_json_error(fd, 401, "Authentication required for billing");
+    }
+
+    char *json_body = NULL;
+    char price_requested[128] = {0};
+    if (body && body_len > 0) {
+        json_body = strndup((const char *)body, body_len);
+        if (!json_body) {
+            return fp_send_json_error(fd, 500, "Out of memory");
+        }
+        if (fp_extract_json_string(json_body, "priceId", price_requested, sizeof(price_requested)) <= 0) {
+            fp_extract_json_string(json_body, "price", price_requested, sizeof(price_requested));
+        }
+        fp_trim_token(price_requested);
+    }
+
+    char price_monthly[128];
+    char price_annual[128];
+    fp_load_price_ids(price_monthly, sizeof(price_monthly), price_annual, sizeof(price_annual));
+    char interval[16] = {0};
+    const char *price_id = fp_pick_price_id(price_requested, price_monthly, price_annual, interval, sizeof(interval));
+    if (interval[0] == '\0') {
+        snprintf(interval, sizeof(interval), "monthly");
+    }
+
+    char session_id[96];
+    char subscription_id[96];
+    char customer_id[96];
+    fp_generate_stub_id("cs_test_", session_id, sizeof(session_id));
+    fp_generate_stub_id("sub_local_", subscription_id, sizeof(subscription_id));
+    fp_generate_stub_id("cus_local_", customer_id, sizeof(customer_id));
+
+    time_t now = time(NULL);
+    time_t period_end = now + fp_period_for_price(price_id, price_monthly, price_annual);
+    fp_auth_sync_subscription(auth_store, user.id, "active", customer_id, subscription_id, period_end);
+
+    fp_buffer meta = {0};
+    if (FP_APPEND_LITERAL(&meta, "{\"priceId\":") == 0 &&
+        fp_buffer_append_json_string(&meta, price_id) == 0 &&
+        FP_APPEND_LITERAL(&meta, ",\"sessionId\":") == 0 &&
+        fp_buffer_append_json_string(&meta, session_id) == 0 &&
+        FP_APPEND_LITERAL(&meta, ",\"subscriptionId\":") == 0 &&
+        fp_buffer_append_json_string(&meta, subscription_id) == 0 &&
+        FP_APPEND_LITERAL(&meta, ",\"customerId\":") == 0 &&
+        fp_buffer_append_json_string(&meta, customer_id) == 0 &&
+        FP_APPEND_LITERAL(&meta, ",\"interval\":") == 0 &&
+        fp_buffer_append_json_string(&meta, interval) == 0 &&
+        FP_APPEND_LITERAL(&meta, "}") == 0) {
+        fp_auth_record_audit(auth_store, user.id, "checkout_session_created", meta.data);
+    } else {
+        fp_auth_record_audit(auth_store, user.id, "checkout_session_created", NULL);
+    }
+    fp_buffer_free(&meta);
+
+    char checkout_url[256];
+    const char *billing_base = getenv("FP_CHECKOUT_BASE_URL");
+    if (billing_base && *billing_base) {
+        snprintf(checkout_url, sizeof(checkout_url), "%s?session_id=%s", billing_base, session_id);
+    } else {
+        snprintf(checkout_url, sizeof(checkout_url), "https://billing.stripe.com/test/session/%s", session_id);
+    }
+
+    fp_buffer resp = {0};
+    if (FP_APPEND_LITERAL(&resp, "{\"status\":\"ok\",\"checkoutUrl\":") != 0 ||
+        fp_buffer_append_json_string(&resp, checkout_url) != 0 ||
+        FP_APPEND_LITERAL(&resp, ",\"sessionId\":") != 0 ||
+        fp_buffer_append_json_string(&resp, session_id) != 0 ||
+        FP_APPEND_LITERAL(&resp, ",\"subscriptionId\":") != 0 ||
+        fp_buffer_append_json_string(&resp, subscription_id) != 0 ||
+        FP_APPEND_LITERAL(&resp, ",\"customerId\":") != 0 ||
+        fp_buffer_append_json_string(&resp, customer_id) != 0 ||
+        FP_APPEND_LITERAL(&resp, ",\"priceId\":") != 0 ||
+        fp_buffer_append_json_string(&resp, price_id) != 0 ||
+        FP_APPEND_LITERAL(&resp, ",\"interval\":") != 0 ||
+        fp_buffer_append_json_string(&resp, interval) != 0 ||
+        FP_APPEND_LITERAL(&resp, ",\"currentPeriodEnd\":") != 0 ||
+        fp_buffer_appendf(&resp, "%lld", (long long)period_end) != 0 ||
+        FP_APPEND_LITERAL(&resp, "}") != 0) {
+        fp_buffer_free(&resp);
+        if (json_body) {
+            free(json_body);
+        }
+        return fp_send_json_error(fd, 500, "Internal error");
+    }
+
+    int rc = fp_send_http(fd, 200, "OK", "application/json", resp.data, resp.size);
+    fp_buffer_free(&resp);
+    if (json_body) {
+        free(json_body);
+    }
+    return rc;
+}
+
+static int fp_handle_billing_portal(int fd, const fp_http_request *request, fp_auth_store *auth_store) {
+    if (!auth_store) {
+        return fp_send_json_error(fd, 500, "Billing unavailable");
+    }
+    fp_auth_user user = {0};
+    if (fp_authenticate_request(auth_store, request, &user) != 1) {
+        return fp_send_json_error(fd, 401, "Authentication required for billing");
+    }
+    fp_auth_subscription sub;
+    if (fp_auth_get_subscription(auth_store, user.id, &sub) != 0) {
+        return fp_send_json_error(fd, 404, "No subscription on file");
+    }
+
+    char portal_url[256];
+    const char *portal_base = getenv("FP_PORTAL_BASE_URL");
+    const char *id = sub.stripe_customer_id[0] ? sub.stripe_customer_id : sub.stripe_subscription_id;
+    if (portal_base && *portal_base) {
+        snprintf(portal_url, sizeof(portal_url), "%s?customer_id=%s", portal_base, id);
+    } else {
+        snprintf(portal_url, sizeof(portal_url), "https://billing.stripe.com/p/portal/%s", id);
+    }
+
+    fp_buffer audit_meta = {0};
+    if (FP_APPEND_LITERAL(&audit_meta, "{\"customerId\":") == 0 &&
+        fp_buffer_append_json_string(&audit_meta, sub.stripe_customer_id) == 0 &&
+        FP_APPEND_LITERAL(&audit_meta, ",\"subscriptionId\":") == 0 &&
+        fp_buffer_append_json_string(&audit_meta, sub.stripe_subscription_id) == 0 &&
+        FP_APPEND_LITERAL(&audit_meta, "}") == 0) {
+        fp_auth_record_audit(auth_store, user.id, "billing_portal_link", audit_meta.data);
+    } else {
+        fp_auth_record_audit(auth_store, user.id, "billing_portal_link", NULL);
+    }
+    fp_buffer_free(&audit_meta);
+
+    fp_buffer resp = {0};
+    if (FP_APPEND_LITERAL(&resp, "{\"status\":\"ok\",\"portalUrl\":") != 0 ||
+        fp_buffer_append_json_string(&resp, portal_url) != 0 ||
+        FP_APPEND_LITERAL(&resp, ",\"subscriptionId\":") != 0 ||
+        fp_buffer_append_json_string(&resp, sub.stripe_subscription_id) != 0 ||
+        FP_APPEND_LITERAL(&resp, ",\"customerId\":") != 0 ||
+        fp_buffer_append_json_string(&resp, sub.stripe_customer_id) != 0 ||
+        FP_APPEND_LITERAL(&resp, ",\"subscriptionStatus\":") != 0 ||
+        fp_buffer_append_json_string(&resp, sub.status) != 0 ||
+        FP_APPEND_LITERAL(&resp, ",\"currentPeriodEnd\":") != 0 ||
+        fp_buffer_appendf(&resp, "%lld", (long long)sub.current_period_end) != 0 ||
+        FP_APPEND_LITERAL(&resp, "}") != 0) {
+        fp_buffer_free(&resp);
+        return fp_send_json_error(fd, 500, "Internal error");
+    }
+
+    int rc = fp_send_http(fd, 200, "OK", "application/json", resp.data, resp.size);
+    fp_buffer_free(&resp);
+    return rc;
+}
+
+static int fp_handle_stripe_webhook(int fd, const fp_http_request *request, const uint8_t *body, size_t body_len,
+                                    fp_auth_store *auth_store) {
+    (void)request;
+    if (!auth_store) {
+        return fp_send_json_error(fd, 500, "Billing unavailable");
+    }
+    if (!body || body_len == 0) {
+        return fp_send_json_error(fd, 400, "Missing body");
+    }
+    char *json = strndup((const char *)body, body_len);
+    if (!json) {
+        return fp_send_json_error(fd, 500, "Out of memory");
+    }
+    char event_type[128] = {0};
+    char status[64] = {0};
+    char customer[128] = {0};
+    char subscription[128] = {0};
+    fp_extract_json_string(json, "type", event_type, sizeof(event_type));
+    fp_extract_json_string(json, "status", status, sizeof(status));
+    fp_extract_json_string(json, "customer", customer, sizeof(customer));
+    fp_extract_json_string(json, "subscription", subscription, sizeof(subscription));
+    if (subscription[0] == '\0') {
+        fp_extract_json_string(json, "subscriptionId", subscription, sizeof(subscription));
+    }
+    if (customer[0] == '\0') {
+        fp_extract_json_string(json, "customerId", customer, sizeof(customer));
+    }
+    int parsed_period_end = 0;
+    time_t period_end = 0;
+    if (fp_json_parse_int(json, "currentPeriodEnd", &parsed_period_end) == 1 ||
+        fp_json_parse_int(json, "current_period_end", &parsed_period_end) == 1) {
+        period_end = (time_t)parsed_period_end;
+    }
+    int parsed_user_id = 0;
+    uint64_t user_id = 0;
+    if (fp_json_parse_int(json, "userId", &parsed_user_id) == 1 && parsed_user_id > 0) {
+        user_id = (uint64_t)parsed_user_id;
+    } else {
+        fp_auth_find_user_by_stripe(auth_store, customer, subscription, &user_id);
+    }
+
+    char inferred_status[32] = {0};
+    if (status[0] == '\0') {
+        if (strstr(event_type, "deleted")) {
+            snprintf(inferred_status, sizeof(inferred_status), "canceled");
+        } else if (strstr(event_type, "payment_failed")) {
+            snprintf(inferred_status, sizeof(inferred_status), "past_due");
+        } else if (strstr(event_type, "checkout.session.completed") || strstr(event_type, "payment_succeeded")) {
+            snprintf(inferred_status, sizeof(inferred_status), "active");
+        }
+    }
+    const char *final_status = status[0] ? status : (inferred_status[0] ? inferred_status : "active");
+
+    if (user_id == 0) {
+        free(json);
+        return fp_send_json_error(fd, 202, "No matching user for webhook");
+    }
+
+    fp_auth_sync_subscription(auth_store, user_id, final_status, customer, subscription, period_end);
+    if (!fp_auth_has_active_subscription(auth_store, user_id)) {
+        fp_auth_revoke_api_keys(auth_store, user_id, "subscription_inactive");
+    }
+
+    fp_buffer audit_meta = {0};
+    if (FP_APPEND_LITERAL(&audit_meta, "{\"event\":") == 0 &&
+        fp_buffer_append_json_string(&audit_meta, event_type) == 0 &&
+        FP_APPEND_LITERAL(&audit_meta, ",\"status\":") == 0 &&
+        fp_buffer_append_json_string(&audit_meta, final_status) == 0 &&
+        FP_APPEND_LITERAL(&audit_meta, ",\"customer\":") == 0 &&
+        fp_buffer_append_json_string(&audit_meta, customer) == 0 &&
+        FP_APPEND_LITERAL(&audit_meta, ",\"subscription\":") == 0 &&
+        fp_buffer_append_json_string(&audit_meta, subscription) == 0 &&
+        FP_APPEND_LITERAL(&audit_meta, "}") == 0) {
+        fp_auth_record_audit(auth_store, user_id, "stripe_webhook", audit_meta.data);
+    } else {
+        fp_auth_record_audit(auth_store, user_id, "stripe_webhook", NULL);
+    }
+    fp_buffer_free(&audit_meta);
+
+    fp_buffer resp = {0};
+    FP_APPEND_LITERAL(&resp, "{\"status\":\"ok\"}");
+    int rc = fp_send_http(fd, 200, "OK", "application/json", resp.data, resp.size);
+    fp_buffer_free(&resp);
     free(json);
     return rc;
 }
@@ -1594,10 +2615,23 @@ static int fp_handle_compress(int fd, const fp_http_request *request, uint8_t *b
 
 static int fp_handle_expert_compress(int fd, const fp_http_request *request, uint8_t *body,
                                      fp_queue *job_queue, fp_queue *result_queue,
-                                     fp_progress_registry *progress_registry) {
+                                     fp_progress_registry *progress_registry,
+                                     fp_auth_store *auth_store) {
     if (!request || !body) {
         free(body);
         return fp_send_json_error(fd, 400, "Invalid request");
+    }
+
+    struct timespec request_start;
+    clock_gettime(CLOCK_MONOTONIC, &request_start);
+
+    fp_auth_user authed_user = {0};
+    char auth_source[32] = {0};
+    char deny_reason[128] = {0};
+    if (!fp_is_expert_authorized(request, auth_store, &authed_user, auth_source, sizeof(auth_source), deny_reason, sizeof(deny_reason))) {
+        fp_log_warn("🚫 Expert auth failed for %s (%s)", request->path, deny_reason[0] ? deny_reason : "unauthorized");
+        free(body);
+        return fp_send_json_error(fd, 401, deny_reason[0] ? deny_reason : "Expert mode requires Authorization: ApiKey <token>");
     }
 
     char boundary[128];
@@ -1615,14 +2649,27 @@ static int fp_handle_expert_compress(int fd, const fp_http_request *request, uin
 
     fp_expert_options opts;
     fp_set_default_expert_options(&opts);
+    fp_expert_options file_opts[FP_EXPERT_MAX_FILES];
+    int file_opts_set[FP_EXPERT_MAX_FILES] = {0};
 
     const fp_form_part *file_parts[FP_EXPERT_MAX_FILES];
     char filenames[FP_EXPERT_MAX_FILES][FP_FILENAME_MAX];
     size_t file_count = 0;
     size_t total_bytes = 0;
+    size_t total_input_bytes = 0;
+    size_t total_output_bytes = 0;
+    size_t total_saved_bytes = 0;
+    double request_elapsed_ms = 0.0;
 
     for (size_t i = 0; i < part_count; ++i) {
         fp_form_part part = parts[i];
+        int metadata_index = fp_metadata_index_from_part_name(part.name);
+        if (metadata_index >= 0 && (size_t)metadata_index < FP_EXPERT_MAX_FILES) {
+            fp_copy_expert_options(&file_opts[metadata_index], &opts);
+            fp_parse_expert_metadata(part.data, part.size, &file_opts[metadata_index]);
+            file_opts_set[metadata_index] = 1;
+            continue;
+        }
         if (strcasecmp(part.name, "metadata") == 0) {
             fp_parse_expert_metadata(part.data, part.size, &opts);
             continue;
@@ -1638,11 +2685,11 @@ static int fp_handle_expert_compress(int fd, const fp_http_request *request, uin
             }
             if (part.size > FP_EXPERT_MAX_FILE) {
                 free(body);
-                return fp_send_json_error(fd, 413, "File too large for Expert mode");
+                return fp_send_json_error(fd, 413, "File too large for Expert mode (max 20MB)");
             }
             if (total_bytes + part.size > FP_EXPERT_MAX_TOTAL) {
                 free(body);
-                return fp_send_json_error(fd, 413, "Total payload too large for Expert mode");
+                return fp_send_json_error(fd, 413, "Total payload too large for Expert mode (max 100MB)");
             }
             fp_sanitize_filename(filenames[file_count], sizeof(filenames[file_count]), part.filename);
             if (filenames[file_count][0] == '\0') {
@@ -1653,11 +2700,29 @@ static int fp_handle_expert_compress(int fd, const fp_http_request *request, uin
         }
     }
 
-    fp_log_info("📦 Expert request: parts=%zu files=%zu total=%zu bytes", part_count, file_count, total_bytes);
+    fp_log_info("📦 Expert request: user=%llu source=%s parts=%zu files=%zu total=%zu bytes",
+                (unsigned long long)authed_user.id,
+                auth_source[0] ? auth_source : "unknown",
+                part_count,
+                file_count,
+                total_bytes);
 
     if (file_count == 0) {
         free(body);
         return fp_send_json_error(fd, 400, "No files provided");
+    }
+
+    for (size_t i = 0; i < file_count; ++i) {
+        if (!file_opts_set[i]) {
+            fp_copy_expert_options(&file_opts[i], &opts);
+            file_opts_set[i] = 1;
+        }
+    }
+
+    char usage_err[128] = {0};
+    if (fp_track_expert_usage(authed_user.id, file_count, total_bytes, usage_err, sizeof(usage_err)) != 0) {
+        free(body);
+        return fp_send_json_error(fd, 429, usage_err[0] ? usage_err : "Daily limit reached");
     }
 
     fp_result *results[FP_EXPERT_MAX_FILES] = {0};
@@ -1691,7 +2756,7 @@ static int fp_handle_expert_compress(int fd, const fp_http_request *request, uin
         fp_sanitize_filename(job->filename, sizeof(job->filename), filenames[i]);
         snprintf(response_names[i], sizeof(response_names[i]), "%s", job->filename);
 
-        fp_populate_expert_outputs(job, &opts);
+        fp_populate_expert_outputs(job, &file_opts[i]);
 
         int status_code = 200;
         char error_buf[128] = {0};
@@ -1718,7 +2783,29 @@ static int fp_handle_expert_compress(int fd, const fp_http_request *request, uin
         results[i] = result;
     }
 
-    rc = fp_send_expert_payload(fd, results, response_names, file_count);
+    struct timespec request_end;
+    clock_gettime(CLOCK_MONOTONIC, &request_end);
+    request_elapsed_ms = fp_elapsed_ms(&request_start, &request_end);
+
+    total_input_bytes = 0;
+    total_output_bytes = 0;
+    for (size_t i = 0; i < file_count; ++i) {
+        fp_result *res = results[i];
+        if (!res) {
+            continue;
+        }
+        size_t best_output = res->input_size;
+        total_input_bytes += res->input_size;
+        for (size_t j = 0; j < res->output_count; ++j) {
+            if (res->outputs[j].size < best_output) {
+                best_output = res->outputs[j].size;
+            }
+        }
+        total_output_bytes += best_output;
+    }
+    total_saved_bytes = total_input_bytes > total_output_bytes ? total_input_bytes - total_output_bytes : 0;
+
+    rc = fp_send_expert_payload(fd, results, response_names, file_opts, file_count, request_elapsed_ms);
 
 expert_cleanup:
     for (size_t i = 0; i < file_count; ++i) {
@@ -1729,11 +2816,35 @@ expert_cleanup:
         }
     }
     free(body);
+    atomic_fetch_add(&g_expert_request_count, 1);
+    atomic_fetch_add(&g_expert_request_files, file_count);
+    atomic_fetch_add(&g_expert_request_bytes, total_input_bytes);
+    fp_log_info("📊 Expert usage user=%llu files=%zu in=%zu out=%zu saved=%zu elapsed=%.2fms",
+                (unsigned long long)authed_user.id,
+                file_count,
+                total_input_bytes,
+                total_output_bytes,
+                total_saved_bytes,
+                request_elapsed_ms);
+    if (auth_store && authed_user.id) {
+        fp_buffer audit = {0};
+        if (FP_APPEND_LITERAL(&audit, "{") == 0 &&
+            fp_buffer_appendf(&audit, "\"files\":%zu,\"bytes_in\":%zu,\"bytes_out\":%zu,\"saved\":%zu,\"elapsed_ms\":%.3f",
+                              file_count,
+                              total_input_bytes,
+                              total_output_bytes,
+                              total_saved_bytes,
+                              request_elapsed_ms) == 0) {
+            FP_APPEND_LITERAL(&audit, "}");
+        }
+        fp_auth_record_audit(auth_store, authed_user.id, "expert_request", audit.data);
+        fp_buffer_free(&audit);
+    }
     return rc;
 }
 
 static void fp_handle_client(int client_fd, fp_queue *job_queue, fp_queue *result_queue,
-                             fp_progress_registry *progress_registry) {
+                             fp_progress_registry *progress_registry, fp_auth_store *auth_store) {
     char *header_buffer = NULL;
     size_t header_len = 0;
     size_t total_len = 0;
@@ -1808,6 +2919,11 @@ static void fp_handle_client(int client_fd, fp_queue *job_queue, fp_queue *resul
             free(body);
             return;
         }
+        if (strcmp(request.path, "/env.js") == 0) {
+            fp_send_env_js(client_fd);
+            free(body);
+            return;
+        }
         fp_send_static_file(client_fd, request.path);
         free(body);
         return;
@@ -1831,12 +2947,51 @@ static void fp_handle_client(int client_fd, fp_queue *job_queue, fp_queue *resul
             fp_send_json_error(client_fd, 400, "Missing body");
             return;
         }
-        fp_handle_expert_compress(client_fd, &request, body, job_queue, result_queue, progress_registry);
+        fp_handle_expert_compress(client_fd, &request, body, job_queue, result_queue, progress_registry, auth_store);
+        return;
+    }
+
+    if (strcmp(request.method, "POST") == 0 && strcmp(request.path, "/api/stripe/checkout") == 0) {
+        int rc = fp_handle_checkout_session(client_fd, &request, body, request.content_length, auth_store);
+        free(body);
+        (void)rc;
+        return;
+    }
+
+    if (strcmp(request.method, "POST") == 0 && strcmp(request.path, "/api/stripe/portal") == 0) {
+        int rc = fp_handle_billing_portal(client_fd, &request, auth_store);
+        free(body);
+        (void)rc;
+        return;
+    }
+
+    if (strcmp(request.method, "POST") == 0 && strcmp(request.path, "/webhook/stripe") == 0) {
+        int rc = fp_handle_stripe_webhook(client_fd, &request, body, request.content_length, auth_store);
+        free(body);
+        (void)rc;
         return;
     }
 
     if (strcmp(request.method, "POST") == 0 && strcmp(request.path, "/auth/google") == 0) {
-        int rc = fp_handle_google_auth(client_fd, body, request.content_length);
+        int rc = fp_handle_google_auth(client_fd, &request, body, request.content_length, auth_store);
+        free(body);
+        (void)rc;
+        return;
+    }
+
+    if (strcmp(request.method, "POST") == 0 && strcmp(request.path, "/auth/facebook") == 0) {
+        int rc = fp_handle_facebook_auth(client_fd, &request, body, request.content_length, auth_store);
+        free(body);
+        (void)rc;
+        return;
+    }
+
+    if (strcmp(request.method, "POST") == 0 && strcmp(request.path, "/api/keys") == 0) {
+        if (!body) {
+            fp_send_json_error(client_fd, 400, "Missing body");
+            return;
+        }
+        int rc = fp_handle_api_key_issue(client_fd, &request, body, request.content_length, auth_store);
         free(body);
         (void)rc;
         return;
@@ -1851,6 +3006,7 @@ typedef struct {
     fp_queue *job_queue;
     fp_queue *result_queue;
     fp_progress_registry *progress_registry;
+    fp_auth_store *auth_store;
 } fp_client_context;
 
 static void *fp_client_thread(void *arg) {
@@ -1858,16 +3014,17 @@ static void *fp_client_thread(void *arg) {
     if (!ctx) {
         return NULL;
     }
-    fp_handle_client(ctx->fd, ctx->job_queue, ctx->result_queue, ctx->progress_registry);
+    fp_handle_client(ctx->fd, ctx->job_queue, ctx->result_queue, ctx->progress_registry, ctx->auth_store);
     close(ctx->fd);
     free(ctx);
     return NULL;
 }
 
 int fp_server_run(const char *host, int port, size_t worker_count, fp_queue *job_queue,
-                  fp_queue *result_queue, fp_progress_registry *progress_registry) {
+                  fp_queue *result_queue, fp_progress_registry *progress_registry,
+                  fp_auth_store *auth_store) {
     (void)worker_count;
-    if (!job_queue || !result_queue || !progress_registry) {
+    if (!job_queue || !result_queue || !progress_registry || !auth_store) {
         return -1;
     }
 
@@ -1937,11 +3094,12 @@ int fp_server_run(const char *host, int port, size_t worker_count, fp_queue *job
         ctx->job_queue = job_queue;
         ctx->result_queue = result_queue;
         ctx->progress_registry = progress_registry;
+        ctx->auth_store = auth_store;
 
         pthread_t thread;
         if (pthread_create(&thread, NULL, fp_client_thread, ctx) != 0) {
             fp_log_warn("⚠️  Failed to spawn client thread; handling inline");
-            fp_handle_client(client_fd, job_queue, result_queue, progress_registry);
+            fp_handle_client(client_fd, job_queue, result_queue, progress_registry, auth_store);
             close(client_fd);
             free(ctx);
         } else {

@@ -12,6 +12,12 @@ const metricsList = document.getElementById('metrics-list');
 const consoleLog = document.getElementById('console-log');
 const consoleSection = document.getElementById('console');
 const googleLoginBtn = document.getElementById('google-login');
+const loginToggle = document.getElementById('login-toggle');
+const loginDropdown = document.getElementById('login-dropdown');
+const expertOpenBtn = document.getElementById('expert-open');
+const expertModal = document.getElementById('expert-modal');
+const expertCloseBtn = document.getElementById('expert-close');
+const expertModalBackdrop = document.getElementById('expert-modal-backdrop');
 
 const keyForResult = (format = '', label = '') =>
   `${String(format).toLowerCase()}::${String(label).toLowerCase()}`;
@@ -74,6 +80,56 @@ function nextJobId() {
   return Date.now() * 1000 + jobNonce;
 }
 
+function applyLoginToggleLabel(label = 'Login') {
+  if (!loginToggle) return;
+  loginToggle.innerHTML = '';
+  const text = document.createTextNode(label);
+  const caret = document.createElement('span');
+  caret.setAttribute('aria-hidden', 'true');
+  caret.textContent = '▾';
+  caret.className = 'caret';
+  loginToggle.appendChild(text);
+  loginToggle.appendChild(caret);
+}
+
+function closeLoginDropdown() {
+  if (loginDropdown) {
+    loginDropdown.classList.add('hidden');
+  }
+  if (loginToggle) {
+    loginToggle.setAttribute('aria-expanded', 'false');
+  }
+}
+
+function openLoginDropdown() {
+  if (loginDropdown) {
+    loginDropdown.classList.remove('hidden');
+  }
+  if (loginToggle) {
+    loginToggle.setAttribute('aria-expanded', 'true');
+  }
+}
+
+function closeExpertModal() {
+  if (!expertModal) return;
+  expertModal.classList.add('hidden');
+  expertModal.setAttribute('aria-hidden', 'true');
+  document.body.classList.remove('modal-open');
+  if (expertOpenBtn) {
+    expertOpenBtn.focus();
+  }
+}
+
+function openExpertModal() {
+  if (!expertModal) return;
+  expertModal.classList.remove('hidden');
+  expertModal.setAttribute('aria-hidden', 'false');
+  document.body.classList.add('modal-open');
+  if (expertCloseBtn) {
+    expertCloseBtn.focus();
+  }
+}
+
 ['dragenter', 'dragover', 'dragleave', 'drop'].forEach((event) => {
   dropZone.addEventListener(event, preventDefaults, false);
 });
@@ -98,7 +154,41 @@ fileInput.addEventListener('change', () => {
 });
 
 document.addEventListener('DOMContentLoaded', () => {
+  applyLoginToggleLabel('Login');
   initGoogleLogin();
+});
+
+if (loginToggle && loginDropdown) {
+  loginToggle.addEventListener('click', (event) => {
+    event.stopPropagation();
+    if (loginDropdown.classList.contains('hidden')) {
+      openLoginDropdown();
+    } else {
+      closeLoginDropdown();
+    }
+  });
+
+  document.addEventListener('click', (event) => {
+    if (!loginDropdown.contains(event.target) && !loginToggle.contains(event.target)) {
+      closeLoginDropdown();
+    }
+  });
+}
+
+if (expertOpenBtn) {
+  expertOpenBtn.addEventListener('click', () => openExpertModal());
+}
+
+[expertCloseBtn, expertModalBackdrop].forEach((element) => {
+  if (element) {
+    element.addEventListener('click', closeExpertModal);
+  }
+});
+
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && expertModal && !expertModal.classList.contains('hidden')) {
+    closeExpertModal();
+  }
 });
 
 function handleFile(file) {
@@ -151,12 +241,13 @@ function toggleUploading(state) {
 
 function setAuthProfile(profile) {
   authProfile = profile;
-  if (profile && googleLoginBtn) {
-    googleLoginBtn.textContent = `Hi, ${profile.name || profile.email || 'user'}`;
-    googleLoginBtn.classList.add('logged-in');
-  } else if (googleLoginBtn) {
-    googleLoginBtn.textContent = 'Login with Google';
-    googleLoginBtn.classList.remove('logged-in');
+  if (profile && loginToggle) {
+    applyLoginToggleLabel(`Hi, ${profile.name || profile.email || 'user'}`);
+    loginToggle.classList.add('logged-in');
+    closeLoginDropdown();
+  } else if (loginToggle) {
+    applyLoginToggleLabel('Login');
+    loginToggle.classList.remove('logged-in');
   }
 }
 

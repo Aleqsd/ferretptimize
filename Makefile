@@ -2,7 +2,7 @@ CC ?= gcc
 CFLAGS ?= -O3 -march=native -std=c11 -Wall -Wextra -pedantic
 CFLAGS += -Iinclude
 LDFLAGS ?=
-LIBS ?= -lpthread -lpng -lwebp -lavif
+LIBS ?= -lpthread -lpng -lwebp -lavif -l:libsqlite3.so.0
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 

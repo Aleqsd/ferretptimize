@@ -8,6 +8,7 @@
 #include "server.h"
 #include "worker.h"
 #include "progress.h"
+#include "auth.h"
 
 static void fp_load_env_file(const char *path) {
     if (!path) {
@@ -93,12 +94,19 @@ int main(void) {
         queue_size = worker_count * 2;
     }
 
+    fp_auth_store auth_store;
+    if (fp_auth_store_init(&auth_store) != 0) {
+        fprintf(stderr, "Failed to initialize auth and persistence\n");
+        return 1;
+    }
+
     fp_queue *job_queue = fp_queue_create(queue_size);
     fp_queue *result_queue = fp_queue_create(queue_size);
     if (!job_queue || !result_queue) {
         fprintf(stderr, "Failed to allocate queues\n");
         fp_queue_destroy(job_queue);
         fp_queue_destroy(result_queue);
+        fp_auth_store_close(&auth_store);
         return 1;
     }
 
@@ -107,6 +115,7 @@ int main(void) {
         fprintf(stderr, "Failed to create progress registry\n");
         fp_queue_destroy(job_queue);
         fp_queue_destroy(result_queue);
+        fp_auth_store_close(&auth_store);
         return 1;
     }
 
@@ -116,14 +125,16 @@ int main(void) {
         fp_queue_destroy(job_queue);
         fp_queue_destroy(result_queue);
         fp_progress_registry_destroy(progress_registry);
+        fp_auth_store_close(&auth_store);
         return 1;
     }
 
-    int rc = fp_server_run(host, port, worker_count, job_queue, result_queue, progress_registry);
+    int rc = fp_server_run(host, port, worker_count, job_queue, result_queue, progress_registry, &auth_store);
 
     fp_workers_destroy(workers, worker_count);
     fp_queue_destroy(job_queue);
     fp_queue_destroy(result_queue);
     fp_progress_registry_destroy(progress_registry);
+    fp_auth_store_close(&auth_store);
     return rc == 0 ? 0 : 1;
 }

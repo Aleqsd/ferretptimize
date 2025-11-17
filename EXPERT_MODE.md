@@ -6,7 +6,7 @@
 - Backward-compatible with the existing `/api/compress` flow and frontend; Expert features are gated and observable.
 
 ## Pricing & Packaging
-- Propose $19/month or $180/year ( ~21% discount ) for Expert mode; start with a 7-day trial to reduce friction.
+- Propose $2/month or $20/year (~2 months free) for Expert mode; start with a 7-day trial to reduce friction.
 - Keep current free tier limited to single-image UI uploads with default presets.
 - Gate Expert entitlements by user_id/subscription status; log audit events for billing disputes.
 
@@ -20,9 +20,10 @@
 - Implement Google and Facebook OAuth (OIDC where available) via the control-plane; store provider, provider_user_id, email, and basic profile.
 - After OAuth callback, create or update the user row and issue a short-lived JWT + refresh token cookie (HttpOnly, Secure, SameSite=Lax).
 - Add an API key issuance endpoint in the user panel; keys are hashed at rest and scoped to Expert entitlements.
+- Interim gate (implemented): set `FP_EXPERT_API_KEYS` (comma separated) or `FP_EXPERT_API_KEY` on the server; `POST /api/expert/compress` requires `Authorization: ApiKey <token>` when a key is configured, otherwise the endpoint remains open for local/dev usage.
 
 ## Stripe Integration
-- Create two Stripe Prices: `price_expert_monthly` ($19) and `price_expert_annual` ($180). Use Stripe Checkout for purchase.
+- Create two Stripe Prices: `price_expert_monthly` ($2) and `price_expert_annual` ($20). Use Stripe Checkout for purchase.
 - Handle `checkout.session.completed`, `invoice.payment_succeeded`, and `customer.subscription.updated/deleted` webhooks to sync subscription status and period end into the DB.
 - Expose a “Manage billing” button that links to Stripe Customer Portal to update payment methods, cancel, or switch plans.
 - On subscription loss, immediately revoke Expert entitlements and API key usage; surface banner in UI.

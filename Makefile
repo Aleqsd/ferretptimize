@@ -15,6 +15,8 @@ TEST_BIN := tests/run_tests
 AUTOTEST_SCRIPT := tests/autotest.sh
 RUNNER := scripts/run_with_browser.sh
 DEPS := $(wildcard include/*.h)
+NETLIFY_DIR ?= public
+NETLIFY_SITE_ID ?= $(shell [ -f .netlify/state.json ] && python3 -c "import json,sys;print(json.load(open('.netlify/state.json')).get('siteId',''))" 2>/dev/null || true)
 
 all: $(BIN)
 
@@ -37,10 +39,18 @@ install: $(BIN)
 run: $(BIN)
 	$(RUNNER)
 
+deploy:
+	@if [ -z "$(NETLIFY_SITE_ID)" ]; then echo "NETLIFY_SITE_ID missing (set it or run netlify init)"; exit 1; fi
+	netlify deploy --prod --site $(NETLIFY_SITE_ID) --dir=$(NETLIFY_DIR)
+
+deploy-temp:
+	@if [ -z "$(NETLIFY_SITE_ID)" ]; then echo "NETLIFY_SITE_ID missing (set it or run netlify init)"; exit 1; fi
+	netlify deploy --site $(NETLIFY_SITE_ID) --dir=$(NETLIFY_DIR)
+
 clean:
 	rm -f $(OBJ) $(BIN) $(TEST_OBJ) $(TEST_BIN)
 
-.PHONY: all clean test autotest install run
+.PHONY: all clean test autotest install run deploy deploy-temp
 
 test: $(TEST_BIN)
 	./$(TEST_BIN)

@@ -1,0 +1,18 @@
+# example netlify.toml
+[build]
+  command = "# no build command"
+  functions = "netlify/functions"
+  publish = "public"
+
+## Proxy API+auth traffic to the running VPS backend (open port 4317 publicly).
+[[redirects]]
+  from = "/api/*"
+  to = "http://51.68.45.129:4317/api/:splat"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/auth/*"
+  to = "http://51.68.45.129:4317/auth/:splat"
+  status = 200
+  force = true

@@ -27,7 +27,9 @@ TMP_DIR="$(mktemp -d)"
 SERVER_LOG="$TMP_DIR/server.log"
 RESPONSE_JSON="$TMP_DIR/response.json"
 RESPONSE_TUNED_JSON="$TMP_DIR/response_tuned.json"
+RESPONSE_EXPERT_JSON="$TMP_DIR/response_expert.json"
 GENERATED_PNG="$TMP_DIR/autotest.png"
+export RESPONSE_EXPERT_JSON
 export GENERATED_PNG
 
 python3 - <<'PY'
@@ -38,10 +40,12 @@ rows = []
 for y in range(h):
     row = bytearray()
     for x in range(w):
+        # Leave a transparent 8px border for trim/crop tests
+        border = (x < 8 or y < 8 or x >= w - 8 or y >= h - 8)
         r = random.randrange(0, 256)
         g = random.randrange(0, 256)
         b = random.randrange(0, 256)
-        a = 255
+        a = 0 if border else 255
         row.extend([r, g, b, a])
     rows.append(b'\x00' + bytes(row))  # filter type 0
 raw = b''.join(rows)
@@ -196,4 +200,33 @@ run_tune("webp", "high", "more", sys.argv[2])
 
 print("✅ [autotest] All variants validated")
 print("✅ [autotest] Tuning paths validated")
+
+# Expert mode: two files, crop applied via metadata, verify geometry/results
+curl_cmd_expert = [
+    "curl", "--fail", "--silent", "--show-error",
+    "-F", f"files[]=@{os.environ['TEST_PNG']};filename=expert1.png",
+    "-F", f"files[]=@{os.environ['TEST_PNG']};filename=expert2.png",
+    "-F", 'metadata={"crop":{"enabled":true,"x":12,"y":12,"width":64,"height":48},"webpQuality":80,"pngLevel":7};type=application/json',
+    f"http://{os.environ['HOST']}:{os.environ['PORT']}/api/expert/compress"
+]
+with open(os.environ["RESPONSE_EXPERT_JSON"], "w", encoding="utf-8") as outf:
+    subprocess.run(curl_cmd_expert, check=True, stdout=outf)
+
+expert = load_json(os.environ["RESPONSE_EXPERT_JSON"])
+files = expert.get("files") or []
+if expert.get("status") != "ok":
+    raise SystemExit(f"expert autotest: server returned error {expert.get('message')}")
+if len(files) != 2:
+    raise SystemExit(f"expert autotest: expected 2 file results, got {len(files)}")
+for idx, item in enumerate(files, 1):
+    geom = item.get("geometry") or {}
+    if geom.get("outputWidth") != 64 or geom.get("outputHeight") != 48:
+        raise SystemExit(f"expert autotest: file {idx} geometry mismatch {geom}")
+    if not item.get("cropApplied"):
+        raise SystemExit(f"expert autotest: expected cropApplied=true for file {idx}")
+    outputs = item.get("results") or []
+    if len(outputs) != 4:
+        raise SystemExit(f"expert autotest: expected 4 outputs per file, got {len(outputs)}")
+print_summary("autotest-expert", {"jobId": files[0].get("jobId"), "durationMs": files[0].get("durationMs", 0), "inputBytes": files[0].get("inputBytes", 0), "filename": files[0].get("filename"), "results": files[0].get("results")})
+print("✅ [autotest] Expert multipart path validated")
 PY

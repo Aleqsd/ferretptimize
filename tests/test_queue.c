@@ -11,6 +11,9 @@
 
 #include "queue.h"
 
+#define TEST_EXTERN(name) void name(void)
+TEST_EXTERN(run_image_ops_tests);
+
 #define PRODUCER_COUNT 4
 #define CONSUMER_COUNT 4
 #define ITEMS_PER_PRODUCER 512
@@ -201,6 +204,7 @@ int main(void) {
     test_queue_mpmc();
     test_queue_fifo_order();
     test_queue_capacity_backpressure();
+    run_image_ops_tests();
     printf("[tests] queue suite passed\n");
     return 0;
 }

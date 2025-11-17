@@ -2,11 +2,53 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 #include "queue.h"
 #include "server.h"
 #include "worker.h"
 #include "progress.h"
+
+static void fp_load_env_file(const char *path) {
+    if (!path) {
+        return;
+    }
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        return;
+    }
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        char *cursor = line;
+        while (*cursor == ' ' || *cursor == '\t') {
+            ++cursor;
+        }
+        if (*cursor == '#' || *cursor == '\n' || *cursor == '\0') {
+            continue;
+        }
+        char *eq = strchr(cursor, '=');
+        if (!eq) {
+            continue;
+        }
+        *eq = '\0';
+        char *key = cursor;
+        char *value = eq + 1;
+        // trim trailing whitespace from key
+        for (char *end = key + strlen(key) - 1; end >= key && isspace((unsigned char)*end); --end) {
+            *end = '\0';
+        }
+        // trim trailing newline or spaces from value
+        char *val_end = value + strlen(value);
+        while (val_end > value && (val_end[-1] == '\n' || val_end[-1] == '\r' || isspace((unsigned char)val_end[-1]))) {
+            *--val_end = '\0';
+        }
+        if (*key == '\0') {
+            continue;
+        }
+        setenv(key, value, 0); // do not overwrite existing env vars
+    }
+    fclose(f);
+}
 
 static size_t fp_read_size_env(const char *name, size_t fallback) {
     const char *value = getenv(name);
@@ -35,6 +77,8 @@ static int fp_read_int_env(const char *name, int fallback) {
 }
 
 int main(void) {
+    fp_load_env_file(".env");
+
     const char *host = getenv("FERRET_HOST");
     if (!host || !*host) {
         host = "0.0.0.0";
